@@ -1,8 +1,6 @@
 const logger = require('../utils/logger');
 const cooldown = require('../utils/cooldown');
 const rateLimitGuard = require('../security/RateLimitGuard');
-const interactionVersioning = require('../security/InteractionVersioning');
-const actionLockManager = require('../security/ActionLockManager');
 const lobbyButtons = require('../lobby/LobbyButtons');
 const nightActionCollector = require('../night/NightActionCollector');
 const sessionManager = require('../core/SessionManager');
@@ -33,6 +31,13 @@ class InteractionRouter {
       handler: (i) => lobbyButtons.handle(i),
       requiresSession: false,
       requiresAlive: false,
+    });
+
+    this.handlers.set('night_panel', {
+      handler: (i) => nightActionCollector.handleNightInteraction(i),
+      requiresSession: true,
+      requiresAlive: true,
+      phase: 'NIGHT',
     });
 
     this.handlers.set('night_KILL', {
@@ -144,19 +149,6 @@ class InteractionRouter {
           rateLimitGuard.recordClick(userId, false);
           return interaction.reply({
             content: `❌ هذه الأزرار خاصة بمرحلة ${handlerConfig.phase}، المرحلة الحالية: ${currentPhase}.`,
-            ephemeral: true,
-          });
-        }
-
-        const versionCheck = interactionVersioning.validateInteraction(
-          sessionKey,
-          handlerConfig.phase,
-          -1,
-        );
-
-        if (!versionCheck.valid) {
-          return interaction.reply({
-            content: '❌ هذا التفاعل من مرحلة قديمة. استخدم الأزرار الجديدة.',
             ephemeral: true,
           });
         }

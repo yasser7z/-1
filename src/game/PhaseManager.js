@@ -1,4 +1,3 @@
-const { STATES } = require('../core/StateMachine');
 const config = require('../../config');
 const logger = require('../utils/logger');
 const nightResolver = require('../night/NightResolver');
@@ -35,15 +34,29 @@ class PhaseManager {
 
     const result = nightResolver.resolve(gameSession);
 
+    const killedPlayer = result.killed ? gameSession.getPlayer(result.killed) : null;
+    const silencedPlayer = result.silenced ? gameSession.getPlayer(result.silenced) : null;
+
     if (result.killed) {
       gameSession.killPlayer(result.killed);
     }
 
-    if (result.silenced) {
-      const silenced = gameSession.getPlayer(result.silenced);
-      if (silenced) {
-        logger.info(`Player ${silenced.username} is silenced today.`);
-      }
+    let announcement = `☀️ **الصباح حل - اليوم ${gameSession.round}**\n\n`;
+    if (killedPlayer) {
+      announcement += `💀 **${killedPlayer.username}** قُتل هذه الليلة!\nكان دوره: **${killedPlayer.role}**\n\n`;
+    } else {
+      announcement += `✅ لم يمت أحد هذه الليلة.\n\n`;
+    }
+    if (silencedPlayer) {
+      announcement += `🔇 **${silencedPlayer.username}** مسكوت عنه اليوم ولا يمكنه التحدث.\n`;
+    }
+    announcement += `⏱️ لديكم ${config.PHASE_DURATIONS.DAY / 1000} ثانية للنقاش.`;
+
+    const aliveList = gameSession.getAlivePlayers().map(p => `<@${p.userId}>`).join(' ');
+    announcement += `\n\n**اللاعبون الأحياء (${gameSession.getAliveCount()})**\n${aliveList}`;
+
+    if (gameSession.channel) {
+      await gameSession.channel.send({ content: announcement }).catch(err => logger.error({ err }, 'Failed to send day announcement'));
     }
 
     gameSession.stateMachine.transitionTo('DAY_DISCUSSION', 'Night ended');
@@ -65,6 +78,12 @@ class PhaseManager {
 
     interactionVersioning.incrementVersion(gameSession.sessionKey, 'DAY_VOTE');
 
+    if (gameSession.channel) {
+      await gameSession.channel.send({
+        content: `🗳️ **التصويت مفتوح!** ⏱️ ${config.PHASE_DURATIONS.VOTE / 1000} ثانية\nصلوا على النبي واختاروا بصوتكم.`,
+      }).catch(err => logger.error({ err }, 'Failed to send vote announcement'));
+    }
+
     gameSession.setTimer('vote_phase', async () => {
       await PhaseManager.endVote(gameSession);
     }, config.PHASE_DURATIONS.VOTE);
@@ -77,6 +96,9 @@ class PhaseManager {
 
     if (votes.length === 0) {
       logger.info(`No votes cast. Skipping trial.`);
+      if (gameSession.channel) {
+        await gameSession.channel.send({ content: '📭 لم يصوت أحد. تخطي المحاكمة.' }).catch(() => {});
+      }
       await PhaseManager.afterTrial(gameSession, null);
       return;
     }
@@ -88,8 +110,12 @@ class PhaseManager {
     if (tied.length > 1) {
       const mayor = gameSession.getPlayersByRole('Mayor')[0];
       if (mayor && mayor.isAlive) {
-        lynched = mayor;
+        lynched = { userId: mayor.userId };
         logger.info(`Mayor breaks tie: ${mayor.username}`);
+      } else {
+        if (gameSession.channel) {
+          await gameSession.channel.send({ content: `🤝 تعادل! لا يتم إعدام أحد.` }).catch(() => {});
+        }
       }
     } else {
       lynched = highestVote;
@@ -101,6 +127,13 @@ class PhaseManager {
 
       const player = gameSession.getPlayer(lynched.userId);
       logger.info(`Player ${player ? player.username : lynched.userId} was lynched.`);
+
+      if (gameSession.channel) {
+        const lynchMsg = player
+          ? `⚖️ **${player.username}** أُعدم بأغلبية الأصوات!\nكان دوره: **${player.role}**`
+          : `⚖️ تم إعدام لاعب بأغلبية الأصوات!`;
+        await gameSession.channel.send({ content: lynchMsg }).catch(() => {});
+      }
     }
 
     await PhaseManager.afterTrial(gameSession, lynched);
@@ -136,6 +169,16 @@ class PhaseManager {
 
     actionLockManager.resetForNight(gameSession.round - 1);
 
+    if (gameSession.channel) {
+      const aliveList = gameSession.getAlivePlayers().map(p => `<@${p.userId}>`).join(' ');
+      await gameSession.channel.send({
+        content: `🌙 **حل الليل - الليلة ${gameSession.round}**\nأصحاب القدرات يستعدون...\n\n**اللاعبون الأحياء (${gameSession.getAliveCount()})**\n${aliveList}`,
+      }).catch(err => logger.error({ err }, 'Failed to send night announcement'));
+    }
+
+    const nightActionCollector = require('../night/NightActionCollector');
+    await nightActionCollector.startCollection(gameSession, gameSession.channel);
+
     await PhaseManager.runNight(gameSession);
   }
 
@@ -145,6 +188,12 @@ class PhaseManager {
 
     gameSession.stateMachine.transitionTo('GAME_OVER', winner);
     interactionVersioning.removeSession(gameSession.sessionKey);
+
+    if (gameSession.channel) {
+      await gameSession.channel.send({
+        content: `🏆 **انتهت اللعبة!**\n**الفائزون:** ${winner}`,
+      }).catch(() => {});
+    }
 
     const { StatsManager } = require('../stats/StatsManager');
     await StatsManager.recordGameEnd(gameSession, winner);
@@ -162,6 +211,13 @@ class PhaseManager {
     gameSession.round = 1;
 
     interactionVersioning.initSession(gameSession.sessionKey, 'NIGHT');
+
+    if (gameSession.channel) {
+      const aliveList = gameSession.getAlivePlayers().map(p => `<@${p.userId}>`).join(' ');
+      await gameSession.channel.send({
+        content: `🎮 **بدأت اللعبة!** 👥 **${gameSession.getPlayerCount()} لاعب**\n🌙 **حل الليل - الليلة 1**\nأصحاب القدرات اضغطوا زر **🎭 إجراءاتي** لإرسال إجراءاتكم.\n\n**اللاعبون (${gameSession.getPlayerCount()})**\n${aliveList}`,
+      }).catch(err => logger.error({ err }, 'Failed to send game start announcement'));
+    }
 
     await PhaseManager.runNight(gameSession);
     return true;

@@ -226,6 +226,7 @@ class LobbyManager {
       }));
 
       const session = GameInitializer.initialize(players, guildId, channelId);
+      session.channel = channel;
       sessionManager.set(session);
 
       await RecoveryService.markSessionInGame(guildId, channelId);
