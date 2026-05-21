@@ -1,71 +1,50 @@
-const { SlashCommandBuilder, EmbedBuilder } = require('discord.js');
-const sessionManager = require('../../core/SessionManager');
-const colors = require('../../constants/colors');
-const emojis = require('../../constants/emojis');
+const { SlashCommandBuilder } = require('discord.js');
+const db = require('../../database/db');
 
 module.exports = {
-  data: new SlashCommandBuilder()
-    .setName('investigate')
-    .setDescription('عرض نتيجة التحقيق (للمحقق)')
-    .addUserOption(option =>
-      option.setName('target')
-        .setDescription('اللاعب المستهدف')
-        .setRequired(true),
-    ),
+    data: new SlashCommandBuilder()
+        .setName('investigate')
+        .setDescription('تحقيق في أحد اللاعبين (استخدام لمرة واحدة)')
+        .addUserOption(option =>
+            option.setName('target')
+                .setDescription('اللاعب المستهدف')
+                .setRequired(true)),
+    async execute(interaction) {
+        const target = interaction.options.getUser('target');
+        const session = interaction.client.sessionManager.get(
+            `${interaction.guildId}_${interaction.channelId}`
+        );
 
-  async execute(interaction) {
-    const guildId = interaction.guildId;
-    const channelId = interaction.channelId;
-    const userId = interaction.user.id;
-    const targetUser = interaction.options.getUser('target');
+        if (!session) {
+            return interaction.reply({ content: '❌ لا توجد لعبة نشطة.', ephemeral: true });
+        }
 
-    if (!targetUser) {
-      return interaction.reply({ content: '❌ يجب تحديد لاعب.', ephemeral: true });
+        const player = session.players.get(interaction.user.id);
+        if (!player || player.role !== 'investigator') {
+            return interaction.reply({ content: '❌ هذا الأمر مخصص للمحقق فقط.', ephemeral: true });
+        }
+
+        const lock = db.prepare(
+            'SELECT locked FROM action_locks WHERE game_id = ? AND user_id = ? AND action = ? AND permanent = 1'
+        ).get(`${interaction.guildId}_${interaction.channelId}`, interaction.user.id, 'night_investigate');
+
+        if (lock) {
+            return interaction.reply({ content: '❌ لقد استخدمت قدرة التحقيق مسبقاً.', ephemeral: true });
+        }
+
+        const targetPlayer = session.players.get(target.id);
+        if (!targetPlayer) {
+            return interaction.reply({ content: '❌ هذا اللاعب ليس في اللعبة.', ephemeral: true });
+        }
+
+        db.prepare(
+            'INSERT INTO action_locks (game_id, user_id, action, permanent) VALUES (?, ?, ?, 1)'
+        ).run(`${interaction.guildId}_${interaction.channelId}`, interaction.user.id, 'night_investigate');
+
+        const role = targetPlayer.role === 'werewolf' ? 'ذئب' : 'قروي';
+        await interaction.reply({
+            content: `🔍 نتيجة التحقيق: **${target.username}** هو **${role}**.`,
+            ephemeral: true
+        });
     }
-
-    const session = sessionManager.get(guildId, channelId);
-    if (!session || !session.isActive) {
-      return interaction.reply({ content: '❌ لا توجد لعبة نشطة.', ephemeral: true });
-    }
-
-    const player = session.getPlayer(userId);
-    if (!player || !player.isAlive) {
-      return interaction.reply({ content: '❌ أنت ميت أو لست في اللعبة.', ephemeral: true });
-    }
-
-    if (player.role !== 'Investigator') {
-      return interaction.reply({ content: '❌ هذا الأمر للمحقق فقط.', ephemeral: true });
-    }
-
-    const phase = session.stateMachine.getState();
-    if (phase !== 'NIGHT') {
-      return interaction.reply({ content: '❌ يمكنك استخدام هذا الأمر فقط في الليل.', ephemeral: true });
-    }
-
-    const target = session.getPlayer(targetUser.id);
-    if (!target || !target.isAlive) {
-      return interaction.reply({ content: '❌ الهدف غير صالح أو ميت.', ephemeral: true });
-    }
-
-    if (target.userId === userId) {
-      return interaction.reply({ content: '❌ لا يمكنك التحقيق مع نفسك.', ephemeral: true });
-    }
-
-    const isWerewolf = target.role === 'Werewolf';
-
-    const embed = new EmbedBuilder()
-      .setColor(isWerewolf ? colors.WEREWOLF_RED : colors.SUCCESS)
-      .setTitle(`${emojis.ROLES.INVESTIGATOR} نتيجة التحقيق`)
-      .setDescription(
-        isWerewolf
-          ? `🔴 **${targetUser.username}** هو **ذئب**!`
-          : `🟢 **${targetUser.username}** ليس ذئباً.`,
-      )
-      .setFooter({ text: `تحقيق الليلة` })
-      .setTimestamp();
-
-    await interaction.reply({ embeds: [embed], ephemeral: true });
-
-    session.recordNightAction(userId, targetUser.id, 'INVESTIGATE');
-  },
 };

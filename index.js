@@ -1,100 +1,64 @@
 require('dotenv').config();
-
 const { Client, GatewayIntentBits, Collection } = require('discord.js');
+const logger = require('./src/utils/logger');
+const db = require('./database/db');
+const SessionManager = require('./src/core/SessionManager');
+const LobbyManager = require('./src/lobby/LobbyManager');
+const DisconnectHandler = require('./src/handlers/DisconnectHandler');
 const fs = require('fs');
 const path = require('path');
-const logger = require('./src/utils/logger');
-const { initDb, close: closeDb } = require('./database/db');
-const lobbyManager = require('./src/lobby/LobbyManager');
-const sessionManager = require('./src/core/SessionManager');
-const nightActionCollector = require('./src/night/NightActionCollector');
-const rateLimitGuard = require('./src/security/RateLimitGuard');
-const interactVersioning = require('./src/security/InteractionVersioning');
-const cooldown = require('./src/utils/cooldown');
-const actionLockManager = require('./src/security/ActionLockManager');
-const nightResolver = require('./src/night/NightResolver');
-
-const express = require('express');
-const webApp = express();
-const WEB_PORT = process.env.PORT || 3000;
-webApp.get('/', (req, res) => res.send('Vale Community Bot is alive'));
-webApp.listen(WEB_PORT, () => console.log(`✅ Web server (keep-alive) running on port ${WEB_PORT}`));
 
 const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent,
-    GatewayIntentBits.GuildMembers,
-    GatewayIntentBits.GuildPresences,
-  ],
+    intents: [
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.MessageContent,
+        GatewayIntentBits.GuildMembers
+    ]
 });
 
-client.commands = { slash: new Collection() };
+client.sessionManager = new SessionManager();
+client.lobbyManager = new LobbyManager(client);
+client.slashCommands = new Collection();
+client.prefixCommands = new Collection();
 
-const slashDir = path.join(__dirname, 'src/commands/slash');
-if (fs.existsSync(slashDir)) {
-  const files = fs.readdirSync(slashDir).filter(f => f.endsWith('.js'));
-  for (const file of files) {
-    try {
-      const cmd = require(path.join(slashDir, file));
-      if (cmd.data && cmd.execute) {
-        client.commands.slash.set(cmd.data.name, cmd);
-        logger.debug(`Loaded slash command: ${cmd.data.name}`);
-      }
-    } catch (err) {
-      logger.error({ err }, `Failed to load slash command: ${file}`);
-    }
-  }
-}
+const disconnectHandler = new DisconnectHandler(client);
 
-const eventsDir = path.join(__dirname, 'events');
-if (fs.existsSync(eventsDir)) {
-  const files = fs.readdirSync(eventsDir).filter(f => f.endsWith('.js'));
-  for (const file of files) {
-    try {
-      const event = require(path.join(eventsDir, file));
-      if (event.once) {
+client.on('guildMemberRemove', async (member) => {
+    await disconnectHandler.handle(member);
+});
+
+const eventFiles = fs.readdirSync(path.join(__dirname, 'events')).filter(f => f.endsWith('.js'));
+for (const file of eventFiles) {
+    const event = require(`./events/${file}`);
+    if (event.once) {
         client.once(event.name, (...args) => event.execute(...args));
-      } else {
+    } else {
         client.on(event.name, (...args) => event.execute(...args));
-      }
-      logger.debug(`Loaded event: ${event.name}`);
-    } catch (err) {
-      logger.error({ err }, `Failed to load event: ${file}`);
     }
-  }
 }
+
+const slashFiles = fs.readdirSync(path.join(__dirname, 'src/commands/slash')).filter(f => f.endsWith('.js'));
+for (const file of slashFiles) {
+    const cmd = require(`./src/commands/slash/${file}`);
+    client.slashCommands.set(cmd.data.name, cmd);
+}
+
+process.on('SIGINT', async () => {
+    logger.info('Shutting down gracefully...');
+    for (const session of client.sessionManager.getAll()) {
+        session.clearPhaseTimer();
+    }
+    db.close();
+    client.destroy();
+    process.exit(0);
+});
+
+process.on('unhandledRejection', (err) => {
+    logger.error(`Unhandled rejection: ${err.message}`);
+});
 
 client.login(process.env.DISCORD_TOKEN).catch(err => {
-  logger.error({ err }, 'Failed to login.');
-  process.exit(1);
-});
-
-function cleanup(reason) {
-  logger.info(`Shutting down: ${reason}`);
-
-  lobbyManager.cleanup();
-  sessionManager.clear();
-  nightActionCollector.activeCollections.clear();
-  rateLimitGuard.destroy();
-  interactVersioning.clear();
-  cooldown.clearAll();
-  actionLockManager.clear();
-  nightResolver.resetLastHealed();
-
-  closeDb();
-
-  client.destroy();
-
-  process.exit(0);
-}
-
-process.on('SIGINT', () => cleanup('SIGINT'));
-process.on('SIGTERM', () => cleanup('SIGTERM'));
-process.on('uncaughtException', (err) => {
-  logger.error({ err }, 'Uncaught exception.');
-});
-process.on('unhandledRejection', (reason) => {
-  logger.error({ reason }, 'Unhandled rejection.');
+    logger.error(`Failed to login: ${err.message}`);
+    process.exit(1);
 });

@@ -1,65 +1,44 @@
+const db = require('../../database/db');
 const logger = require('../utils/logger');
 
 class SessionManager {
-  constructor() {
-    this.sessions = new Map();
-  }
-
-  createKey(guildId, channelId) {
-    return `${guildId}_${channelId}`;
-  }
-
-  set(session) {
-    const key = session.sessionKey || this.createKey(session.guildId, session.channelId);
-    session.sessionKey = key;
-    this.sessions.set(key, session);
-    logger.info(`Session stored: ${key}`);
-  }
-
-  get(guildId, channelId) {
-    const key = this.createKey(guildId, channelId);
-    return this.sessions.get(key) || null;
-  }
-
-  delete(guildId, channelId) {
-    const key = this.createKey(guildId, channelId);
-    const deleted = this.sessions.delete(key);
-    if (deleted) logger.info(`Session deleted: ${key}`);
-    return deleted;
-  }
-
-  has(guildId, channelId) {
-    const key = this.createKey(guildId, channelId);
-    return this.sessions.has(key);
-  }
-
-  getAll() {
-    return Array.from(this.sessions.values());
-  }
-
-  getByGuild(guildId) {
-    const results = [];
-    for (const session of this.sessions.values()) {
-      if (session.guildId === guildId) {
-        results.push(session);
-      }
+    constructor() {
+        this.sessions = new Map();
     }
-    return results;
-  }
 
-  getActiveSessions() {
-    return this.getAll().filter(s => s.isActive === true);
-  }
+    getKey(guildId, channelId) {
+        return `${guildId}_${channelId}`;
+    }
 
-  clear() {
-    const count = this.sessions.size;
-    this.sessions.clear();
-    logger.info(`Cleared ${count} sessions.`);
-  }
+    get(key) {
+        return this.sessions.get(key) || null;
+    }
 
-  get size() {
-    return this.sessions.size;
-  }
+    set(key, session) {
+        this.sessions.set(key, session);
+    }
+
+    delete(key) {
+        this.sessions.delete(key);
+    }
+
+    getAll() {
+        return Array.from(this.sessions.values());
+    }
+
+    saveToDB(session) {
+        const stmt = db.prepare(
+            'INSERT OR REPLACE INTO active_games (guild_id, channel_id) VALUES (?, ?)'
+        );
+        stmt.run(session.guildId, session.channelId);
+        logger.debug(`Saved session ${session.guildId}_${session.channelId} to DB`);
+    }
+
+    restoreFromDB() {
+        const rows = db.prepare('SELECT guild_id, channel_id FROM active_games').all();
+        logger.info(`Restoring ${rows.length} sessions from database`);
+        return rows;
+    }
 }
 
-module.exports = new SessionManager();
+module.exports = SessionManager;

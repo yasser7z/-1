@@ -1,195 +1,127 @@
-const { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
-const config = require('../../config');
-const colors = require('../constants/colors');
-const emojis = require('../constants/emojis');
-const locale = require('../locales/ar');
+const { ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+const ActionLockManager = require('../security/ActionLockManager');
+const InteractionVersioning = require('../security/InteractionVersioning');
+const config = require('../../config/config');
+const GuildConfigManager = require('../config/GuildConfigManager');
 const logger = require('../utils/logger');
-const sessionManager = require('../core/SessionManager');
-const guildConfigManager = require('../config/GuildConfigManager');
-const nightResolver = require('../night/NightResolver');
-const SafeCollector = require('../collectors/SafeCollector');
-const PhaseManager = require('../game/PhaseManager');
-const cooldown = require('../utils/cooldown');
 
 class VoteCollector {
-  constructor() {
-    this.activeCollectors = new Map();
-  }
-
-  async startVote(gameSession, channel) {
-    const sessionKey = gameSession.sessionKey;
-    if (this.activeCollectors.has(sessionKey)) return;
-
-    const embed = this._buildVoteEmbed(gameSession);
-    const components = this._buildVoteButtons(gameSession);
-    const msg = await channel.send({ embeds: [embed], components });
-
-    const guildConfig = guildConfigManager.getOrDefault(gameSession.guildId);
-    const autoAbsent = guildConfig.auto_absent_vote || false;
-
-    const collector = channel.createMessageComponentCollector({
-      filter: i => i.customId.startsWith('vote_'),
-      time: config.PHASE_DURATIONS.VOTE,
-    });
-
-    const state = { gameSession, channel, collector, msg, autoAbsent, resolved: false };
-    this.activeCollectors.set(sessionKey, state);
-
-    collector.on('collect', async (interaction) => {
-      if (state.resolved) return;
-      await this._handleVote(interaction, gameSession, channel);
-    });
-
-    collector.on('end', async () => {
-      if (state.resolved) return;
-      state.resolved = true;
-      this.activeCollectors.delete(sessionKey);
-      await this._resolveVote(gameSession, channel, msg, autoAbsent);
-    });
-
-    logger.info(`Vote started for session ${sessionKey}.`);
-    return state;
-  }
-
-  _buildVoteEmbed(gameSession) {
-    const alive = gameSession.getAlivePlayers();
-    const embed = new EmbedBuilder()
-      .setColor(colors.WARNING)
-      .setTitle(`${emojis.PHASES.VOTE} التصويت على الإعدام`)
-      .setDescription(
-        `${locale.GAME.VOTE_INSTRUCTION}\n` +
-        `⏱️ الوقت المتبقي: ${config.PHASE_DURATIONS.VOTE / 1000} ثانية\n\n` +
-        alive.map((p, i) => `\`${i + 1}\` 👤 <@${p.userId}>`).join('\n')
-      )
-      .setFooter({ text: `Vale Community • الجولة ${gameSession.round}` })
-      .setTimestamp();
-    return embed;
-  }
-
-  _buildVoteButtons(gameSession) {
-    const alive = gameSession.getAlivePlayers();
-    const rows = [];
-    let currentRow = new ActionRowBuilder();
-
-    for (const player of alive) {
-      const label = player.username.length > 20 ? player.username.slice(0, 18) + '..' : player.username;
-      const button = new ButtonBuilder()
-        .setCustomId(`vote_${player.userId}`)
-        .setLabel(label)
-        .setStyle(ButtonStyle.Secondary);
-
-      if (currentRow.components.length >= 5) {
-        rows.push(currentRow);
-        currentRow = new ActionRowBuilder();
-      }
-      currentRow.addComponents(button);
+    constructor(client) {
+        this.client = client;
+        this.lockManager = new ActionLockManager();
+        this.versioning = new InteractionVersioning();
+        this.guildConfig = new GuildConfigManager();
     }
 
-    if (currentRow.components.length > 0) rows.push(currentRow);
-    return rows;
-  }
+    async startVoting(session) {
+        const channel = await this.client.channels.fetch(session.channelId);
+        const alivePlayers = Array.from(session.players.values()).filter(p => p.isAlive);
+        const guildCfg = this.guildConfig.get(session.guildId);
+        const durationMs = (guildCfg.voting_duration || config.PHASE_DURATIONS.VOTING) * 1000;
 
-  async _handleVote(interaction, gameSession, channel) {
-    const customId = interaction.customId;
-    const userId = interaction.user.id;
-    const targetId = customId.replace('vote_', '');
+        const version = this.versioning.getVersion(`${session.guildId}_${session.channelId}`);
 
-    if (cooldown.check(userId, customId, 500)) {
-      return interaction.reply({ content: '⏳ تمهل.', ephemeral: true });
-    }
-    cooldown.set(userId, customId);
-
-    const voter = gameSession.getPlayer(userId);
-    if (!voter || !voter.isAlive) {
-      return interaction.reply({ content: '❌ أنت ميت.', ephemeral: true });
-    }
-
-    if (targetId === userId) {
-      return interaction.reply({ content: '❌ لا يمكنك التصويت على نفسك.', ephemeral: true });
-    }
-
-    const target = gameSession.getPlayer(targetId);
-    if (!target || !target.isAlive) {
-      return interaction.reply({ content: '❌ الهدف ميت.', ephemeral: true });
-    }
-
-    voter.voteTarget = targetId;
-    voter.isVoted = true;
-
-    await interaction.reply({ content: `✅ صوتك مسجل لـ <@${targetId}>.`, ephemeral: true });
-    logger.debug(`${voter.username} voted for ${target.username}`);
-  }
-
-  async _resolveVote(gameSession, channel, msg, autoAbsent) {
-    let voteMap = {};
-    const alivePlayers = gameSession.getAlivePlayers();
-
-    for (const p of alivePlayers) {
-      if (p.voteTarget && p.isVoted) {
-        const weight = p.role === 'King' ? 2 : 1;
-        voteMap[p.voteTarget] = (voteMap[p.voteTarget] || 0) + weight;
-      } else if (autoAbsent && p.isAlive) {
-        const others = alivePlayers.filter(t => t.userId !== p.userId);
-        if (others.length > 0) {
-          const randomTarget = others[Math.floor(Math.random() * others.length)].userId;
-          voteMap[randomTarget] = (voteMap[randomTarget] || 0) + 1;
+        const rows = [];
+        for (let i = 0; i < alivePlayers.length; i += 5) {
+            const batch = alivePlayers.slice(i, i + 5);
+            const row = new ActionRowBuilder();
+            for (const player of batch) {
+                const customId = `${session.guildId}_${session.channelId}_${version}_vote_${player.id}`;
+                row.addComponents(
+                    new ButtonBuilder()
+                        .setCustomId(customId)
+                        .setLabel(player.username)
+                        .setStyle(ButtonStyle.Secondary)
+                );
+            }
+            rows.push(row);
         }
-      }
+
+        const embed = {
+            title: '🗳️ التصويت',
+            description: `اختر من تريد إقصاءه. لديك ${guildCfg.voting_duration || config.PHASE_DURATIONS.VOTING} ثانية.\n\nاللاعبون الأحياء: ${alivePlayers.length}`,
+            color: 0x8B5CF6,
+            timestamp: new Date().toISOString()
+        };
+
+        const msg = await channel.send({ embeds: [embed], components: rows });
+        session.voteMessage = msg;
+
+        session.startPhaseTimer(durationMs, async () => {
+            await this.finalizeVoting(session);
+        });
     }
 
-    const entries = Object.entries(voteMap);
-    if (entries.length === 0 || entries.every(([, c]) => c === 0)) {
-      const embed = new EmbedBuilder()
-        .setColor(colors.WARNING)
-        .setTitle('🚫 لا أحد يُعدم')
-        .setDescription(locale.GAME.NO_LYNCH)
-        .setTimestamp();
-      await msg.edit({ embeds: [embed], components: [] }).catch(() => {});
-      return PhaseManager.afterTrial(gameSession, null);
+    async handleVote(interaction, session, targetId) {
+        const userId = interaction.user.id;
+        const player = session.players.get(userId);
+
+        if (!player || !player.isAlive) {
+            return interaction.reply({ content: '❌ لا يمكنك التصويت.', ephemeral: true });
+        }
+
+        const key = `${session.guildId}_${session.channelId}_${userId}_vote`;
+        if (this.lockManager.isLocked(session.guildId + '_' + session.channelId, userId, 'vote')) {
+            return interaction.reply({ content: '❌ لقد صوت بالفعل.', ephemeral: true });
+        }
+
+        this.lockManager.acquireLock(session.guildId + '_' + session.channelId, userId, 'vote');
+
+        const voteWeight = player.role === 'mayor' ? 2 : 1;
+        const existing = session.votes.get(targetId) || 0;
+        session.votes.set(targetId, existing + voteWeight);
+
+        await interaction.reply({ content: '✅ تم تسجيل صوتك!', ephemeral: true });
     }
 
-    entries.sort((a, b) => b[1] - a[1]);
-    const highestCount = entries[0][1];
-    const tied = entries.filter(([, c]) => c === highestCount);
+    async finalizeVoting(session) {
+        const guildCfg = this.guildConfig.get(session.guildId);
+        const alivePlayers = Array.from(session.players.values()).filter(p => p.isAlive);
 
-    let lynchedId;
-    if (tied.length > 1) {
-      const mayor = gameSession.getPlayersByRole('Mayor')[0];
-      if (mayor && mayor.isAlive) {
-        lynchedId = tied.find(([id]) => id === mayor.userId)
-          ? mayor.userId
-          : tied[Math.floor(Math.random() * tied.length)][0];
-      } else {
-        lynchedId = tied[Math.floor(Math.random() * tied.length)][0];
-      }
-    } else {
-      lynchedId = entries[0][0];
+        if (guildCfg.auto_absent_vote) {
+            for (const player of alivePlayers) {
+                const key = `${session.guildId}_${session.channelId}_${player.id}_vote`;
+                if (!this.lockManager.isLocked(session.guildId + '_' + session.channelId, player.id, 'vote')) {
+                    const targets = alivePlayers.filter(p => p.id !== player.id);
+                    if (targets.length > 0) {
+                        const random = targets[Math.floor(Math.random() * targets.length)];
+                        const voteWeight = player.role === 'mayor' ? 2 : 1;
+                        const existing = session.votes.get(random.id) || 0;
+                        session.votes.set(random.id, existing + voteWeight);
+                        logger.info(`Absent vote: ${player.id} -> ${random.id}`);
+                    }
+                }
+            }
+        }
+
+        let maxVotes = 0;
+        for (const [, count] of session.votes) {
+            if (count > maxVotes) maxVotes = count;
+        }
+
+        let eliminated = null;
+        if (maxVotes > 0) {
+            const topCandidates = Array.from(session.votes.entries())
+                .filter(([, count]) => count === maxVotes)
+                .map(([id]) => id);
+
+            eliminated = topCandidates[Math.floor(Math.random() * topCandidates.length)];
+        }
+
+        if (eliminated) {
+            const player = session.players.get(eliminated);
+            if (player) player.isAlive = false;
+
+            if (session.voteMessage) {
+                try {
+                    await session.voteMessage.edit({ components: [] });
+                } catch (e) {}
+            }
+        }
+
+        session.transitionTo(require('../core/StateMachine').states.PROCESS_VOTES);
+        session.endPhase();
     }
-
-    gameSession.lynchPlayer(lynchedId);
-    const lynched = gameSession.getPlayer(lynchedId);
-
-    const embed = new EmbedBuilder()
-      .setColor(colors.WEREWOLF_RED)
-      .setTitle(`⚖️ حكم الإعدام`)
-      .setDescription(
-        `**<@${lynchedId}>** تم إعدامه!\n` +
-        `كان دوره: **${lynched ? lynched.role : '???'}**`
-      )
-      .setTimestamp();
-    await msg.edit({ embeds: [embed], components: [] }).catch(() => {});
-
-    return PhaseManager.afterTrial(gameSession, lynchedId);
-  }
-
-  cancelVote(sessionKey) {
-    const state = this.activeCollectors.get(sessionKey);
-    if (state) {
-      state.resolved = true;
-      state.collector.stop('cancelled');
-      this.activeCollectors.delete(sessionKey);
-    }
-  }
 }
 
-module.exports = new VoteCollector();
+module.exports = VoteCollector;

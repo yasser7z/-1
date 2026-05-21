@@ -1,290 +1,100 @@
-const { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
-const config = require('../../config');
-const colors = require('../constants/colors');
-const emojis = require('../constants/emojis');
-const locale = require('../locales/ar');
+const { ActionRowBuilder, StringSelectMenuBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+const SafeCollector = require('../collectors/SafeCollector');
+const InteractionVersioning = require('../security/InteractionVersioning');
 const logger = require('../utils/logger');
-const cooldown = require('../utils/cooldown');
-const rateLimitGuard = require('../security/RateLimitGuard');
-const interactionVersioning = require('../security/InteractionVersioning');
-const actionLockManager = require('../security/ActionLockManager');
-const { botCanSend } = require('../utils/permissions');
+const config = require('../../config/config');
 
-const NIGHT_ACTIONS = {
-  Werewolf: { type: 'KILL', label: 'اختر ضحية', emoji: '🐺' },
-  Investigator: { type: 'INVESTIGATE', label: 'تحقيق', emoji: '🔍' },
-  Bodyguard: { type: 'PROTECT', label: 'حماية', emoji: '🛡️' },
-  Doctor: { type: 'SAVE', label: 'إنقاذ', emoji: '💉' },
-  Seductress: { type: 'BLOCK', label: 'إغواء', emoji: '💋' },
-  Um_Zaki: { type: 'SILENCE', label: 'إسكات', emoji: '🧙' },
+const nightRoles = {
+    werewolf: { action: 'night_kill', label: 'اقتل', emoji: '🔪' },
+    investigator: { action: 'night_investigate', label: 'تحقق', emoji: '🔍' },
+    bodyguard: { action: 'night_protect', label: 'احم', emoji: '🛡️' },
+    doctor: { action: 'night_heal', label: 'عالج', emoji: '💉' },
+    seductress: { action: 'night_seduce', label: 'اغو', emoji: '💋' },
+    umzaki: { action: 'night_umzaki', label: 'استخدم قدرة', emoji: '🔮' }
 };
 
 class NightActionCollector {
-  constructor() {
-    this.activeCollections = new Map();
-  }
-
-  async startCollection(gameSession, channel) {
-    const sessionKey = gameSession.sessionKey;
-    if (this.activeCollections.has(sessionKey)) {
-      logger.warn(`Collection already active for ${sessionKey}`);
-      return;
+    constructor(client) {
+        this.client = client;
+        this.versioning = new InteractionVersioning();
     }
 
-    const version = interactionVersioning.incrementVersion(sessionKey, 'NIGHT');
-    actionLockManager.resetForNight(gameSession.round);
+    async collect(session) {
+        const alivePlayers = Array.from(session.players.values()).filter(p => p.isAlive);
+        const channel = await this.client.channels.fetch(session.channelId);
 
-    const alivePlayers = gameSession.getAlivePlayers();
-    const playersWithAbilities = alivePlayers.filter(p =>
-      NIGHT_ACTIONS[p.role] !== undefined,
-    );
-
-    const state = {
-      sessionKey,
-      gameSession,
-      channel,
-      version,
-      playersWithAbilities,
-      startTime: Date.now(),
-      duration: config.PHASE_DURATIONS.NIGHT,
-      timer: null,
-      resolved: false,
-    };
-
-    this.activeCollections.set(sessionKey, state);
-
-    await this._sendNightEmbeds(gameSession, channel, playersWithAbilities);
-
-    logger.info(
-      `Night collection started for ${sessionKey} - ${playersWithAbilities.length} players with abilities`,
-    );
-
-    return state;
-  }
-
-  async _sendNightEmbeds(gameSession, channel, playersWithAbilities) {
-    if (!botCanSend(channel)) return;
-    if (playersWithAbilities.length === 0) return;
-
-    const embed = new EmbedBuilder()
-      .setColor(colors.DARK_BLUE)
-      .setTitle(`${emojis.PHASES.NIGHT} حل الليل`)
-      .setDescription(
-        `🌙 الليل بدأ... أصحاب القدرات الخاصة اضغطوا الزر لإرسال إجراءاتكم.\n` +
-        `⏱️ الوقت المتبقي: ${config.PHASE_DURATIONS.NIGHT / 1000} ثانية`,
-      )
-      .setFooter({ text: `Vale Community • الليل ${gameSession.round}` });
-
-    const row = new ActionRowBuilder().addComponents(
-      new ButtonBuilder()
-        .setCustomId(`night_panel_${gameSession.sessionKey}`)
-        .setLabel('🎭 إجراءاتي')
-        .setStyle(ButtonStyle.Primary),
-    );
-
-    await channel.send({ embeds: [embed], components: [row] });
-  }
-
-  _buildTargetButtons(targets, actionType, sessionKey) {
-    const rows = [];
-    let currentRow = new ActionRowBuilder();
-
-    for (let i = 0; i < targets.length; i++) {
-      const target = targets[i];
-      const customId = `night_${actionType}_${target.userId}_${sessionKey}`;
-
-      const button = new ButtonBuilder()
-        .setCustomId(customId)
-        .setLabel(target.username.length > 20 ? target.username.slice(0, 18) + '..' : target.username)
-        .setStyle(ButtonStyle.Secondary)
-        .setEmoji('👤');
-
-      if (currentRow.components.length >= 5) {
-        rows.push(currentRow);
-        currentRow = new ActionRowBuilder();
-      }
-      currentRow.addComponents(button);
-    }
-
-    if (currentRow.components.length > 0) {
-      rows.push(currentRow);
-    }
-
-    return rows;
-  }
-
-  async handleNightInteraction(interaction) {
-    const customId = interaction.customId;
-    if (!customId.startsWith('night_')) return false;
-
-    const userId = interaction.user.id;
-    const sessionKey = interaction.guildId + '_' + interaction.channelId;
-
-    if (cooldown.check(userId, customId, 500)) {
-      await interaction.reply({
-        content: '⏳ تمهل بين النقرات.',
-        ephemeral: true,
-      });
-      return true;
-    }
-    cooldown.set(userId, customId);
-
-    if (rateLimitGuard.isMuted(userId)) {
-      const timeLeft = Math.ceil(rateLimitGuard.getMutedTimeLeft(userId) / 1000);
-      await interaction.reply({
-        content: `🛑 أنت مكتوم لمدة ${timeLeft} ثانية بسبب السبام.`,
-        ephemeral: true,
-      });
-      return true;
-    }
-
-    const collectionState = this.activeCollections.get(sessionKey);
-    if (!collectionState || collectionState.resolved) {
-      await interaction.reply({
-        content: '❌ انتهت مهلة الليل أو اللعبة غير نشطة.',
-        ephemeral: true,
-      });
-      return true;
-    }
-
-    const gameSession = collectionState.gameSession;
-    const player = gameSession.getPlayer(userId);
-
-    if (!player || !player.isAlive) {
-      rateLimitGuard.recordClick(userId, false);
-      await interaction.reply({
-        content: '❌ أنت ميت أو لست في اللعبة.',
-        ephemeral: true,
-      });
-      return true;
-    }
-
-    if (customId.startsWith('night_panel_')) {
-      const action = NIGHT_ACTIONS[player.role];
-      if (!action) {
-        return interaction.reply({
-          content: '❌ ليس لديك قدرة ليلية.',
-          ephemeral: true,
+        const collector = new SafeCollector(session, {
+            timeout: config.PHASE_DURATIONS.NIGHT * 1000
         });
-      }
 
-      if (actionLockManager.isLocked(userId, gameSession.round)) {
-        return interaction.reply({
-          content: '❌ لقد أرسلت إجراءك بالفعل هذه الليلة.',
-          ephemeral: true,
+        const actions = [];
+
+        for (const player of alivePlayers) {
+            const roleConfig = nightRoles[player.role];
+            if (!roleConfig) continue;
+
+            const targets = alivePlayers
+                .filter(p => p.id !== player.id)
+                .map(p => ({
+                    label: p.username,
+                    value: p.id,
+                    emoji: p.isAlive ? '🟢' : '🔴'
+                }));
+
+            if (targets.length === 0) continue;
+
+            const actionName = roleConfig.action;
+            const customId = this.versioning.getCustomId(
+                `${session.guildId}_${session.channelId}`,
+                actionName,
+                'select'
+            );
+
+            const selectMenu = new StringSelectMenuBuilder()
+                .setCustomId(customId)
+                .setPlaceholder(roleConfig.label)
+                .addOptions(targets.slice(0, 25));
+
+            const row = new ActionRowBuilder().addComponents(selectMenu);
+
+            try {
+                const msg = await channel.send({
+                    content: `<@${player.id}> ${roleConfig.emoji} دورك: **${player.role}** - اختر هدفك:`,
+                    components: [row]
+                });
+
+                actions.push({ playerId: player.id, msg, action: actionName });
+            } catch (err) {
+                logger.error(`Failed to send night action to ${player.id}: ${err.message}`);
+            }
+        }
+
+        collector.startTimeout(() => {
+            this._handleTimeout(session, actions);
         });
-      }
 
-      const roleName = locale.ROLES[player.role.toUpperCase()] || player.role;
-      const roleDesc = locale.ROLES[`${player.role.toUpperCase()}_DESC`] || '';
-
-      const embed = new EmbedBuilder()
-        .setColor(colors.DARK_BLUE)
-        .setTitle(`${emojis.PHASES.NIGHT} ${roleName} - ${action.label}`)
-        .setDescription(
-          `${emojis.MISC.STAR} ${roleDesc}\n\n${locale.GAME.NIGHT_ACTION}\n` +
-          `⏱️ الوقت المتبقي: ${config.PHASE_DURATIONS.NIGHT / 1000} ثانية`,
-        )
-        .setFooter({ text: `Vale Community • الليل ${gameSession.round}` });
-
-      const targets = gameSession.getAlivePlayers().filter(t => t.userId !== player.userId);
-      const rows = this._buildTargetButtons(targets, action.type, gameSession.sessionKey);
-
-      return interaction.reply({ embeds: [embed], components: rows, ephemeral: true });
+        logger.info(`Night actions sent for ${session.guildId}_${session.channelId} (${actions.length} players)`);
+        return collector;
     }
 
-    const parts = customId.split('_');
-    const actionType = parts[1];
-    const targetId = parts[2];
+    _handleTimeout(session, actions) {
+        const alivePlayers = Array.from(session.players.values()).filter(p => p.isAlive);
+        const wolfCount = alivePlayers.filter(p => p.role === 'werewolf' && p.isAlive).length;
+        const wolfActions = Array.from(session.nightActions.entries())
+            .filter(([id]) => alivePlayers.find(p => p.id === id && p.role === 'werewolf'));
 
-    const expectedAction = NIGHT_ACTIONS[player.role];
-    if (!expectedAction || expectedAction.type !== actionType) {
-      rateLimitGuard.recordClick(userId, false);
-      await interaction.reply({
-        content: '❌ ليس لديك هذه القدرة.',
-        ephemeral: true,
-      });
-      return true;
+        if (wolfCount > 0 && wolfActions.length === 0) {
+            const nonWolves = alivePlayers.filter(p => p.role !== 'werewolf');
+            if (nonWolves.length > 0) {
+                const randomTarget = nonWolves[Math.floor(Math.random() * nonWolves.length)];
+                const firstWolf = alivePlayers.find(p => p.role === 'werewolf');
+                if (firstWolf) {
+                    session.nightActions.set(firstWolf.id, randomTarget.id);
+                    logger.info(`Auto-attack: wolf ${firstWolf.id} -> ${randomTarget.id}`);
+                }
+            }
+        }
     }
-
-    if (actionLockManager.isLocked(userId, gameSession.round)) {
-      await interaction.reply({
-        content: '❌ لقد أرسلت إجراءك بالفعل هذه الليلة.',
-        ephemeral: true,
-      });
-      return true;
-    }
-
-    if (targetId === userId) {
-      await interaction.reply({
-        content: '❌ لا يمكنك استهداف نفسك.',
-        ephemeral: true,
-      });
-      return true;
-    }
-
-    const target = gameSession.getPlayer(targetId);
-    if (!target || !target.isAlive) {
-      await interaction.reply({
-        content: '❌ الهدف غير صالح أو ميت.',
-        ephemeral: true,
-      });
-      return true;
-    }
-
-    gameSession.recordNightAction(userId, targetId, actionType);
-    actionLockManager.lock(userId, actionType, gameSession.round);
-
-    await interaction.reply({
-      content: '✅ تم تسجيل إجرائك.',
-      ephemeral: true,
-    });
-
-    logger.info(
-      `Night action: ${player.username} (${player.role}) -> ${target.username} (${actionType})`,
-    );
-
-    await this._checkAllActionsReceived(collectionState);
-
-    return true;
-  }
-
-  async _checkAllActionsReceived(collectionState) {
-    const { gameSession, playersWithAbilities } = collectionState;
-    const round = gameSession.round;
-
-    const allDone = playersWithAbilities.every(p =>
-      actionLockManager.isLocked(p.userId, round),
-    );
-
-    if (allDone && playersWithAbilities.length > 0) {
-      logger.info(`All night actions received for round ${round}. Ending night early.`);
-      collectionState.resolved = true;
-      this.activeCollections.delete(collectionState.sessionKey);
-      const PhaseManager = require('../game/PhaseManager');
-      await PhaseManager.endNight(gameSession);
-    }
-  }
-
-  stopCollection(sessionKey) {
-    const state = this.activeCollections.get(sessionKey);
-    if (state) {
-      if (state.timer) {
-        clearTimeout(state.timer);
-      }
-      state.resolved = true;
-      this.activeCollections.delete(sessionKey);
-      logger.info(`Night collection stopped for ${sessionKey}`);
-    }
-  }
-
-  getActiveCollection(sessionKey) {
-    return this.activeCollections.get(sessionKey) || null;
-  }
-
-  isCollecting(sessionKey) {
-    return this.activeCollections.has(sessionKey);
-  }
 }
 
-module.exports = new NightActionCollector();
+module.exports = NightActionCollector;

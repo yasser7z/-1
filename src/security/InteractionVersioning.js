@@ -1,83 +1,29 @@
+const db = require('../../database/db');
 const logger = require('../utils/logger');
 
 class InteractionVersioning {
-  constructor() {
-    this.versions = new Map();
-  }
-
-  _key(sessionKey) {
-    return sessionKey;
-  }
-
-  getVersion(sessionKey) {
-    const data = this.versions.get(this._key(sessionKey));
-    return data ? data.version : -1;
-  }
-
-  getPhase(sessionKey) {
-    const data = this.versions.get(this._key(sessionKey));
-    return data ? data.phase : null;
-  }
-
-  incrementVersion(sessionKey, newPhase) {
-    const key = this._key(sessionKey);
-    const current = this.versions.get(key);
-    const nextVersion = current ? current.version + 1 : 1;
-
-    this.versions.set(key, {
-      version: nextVersion,
-      phase: newPhase,
-      updatedAt: Date.now(),
-    });
-
-    logger.debug(`Version ${nextVersion} for session ${sessionKey} (phase: ${newPhase})`);
-    return nextVersion;
-  }
-
-  validateInteraction(sessionKey, expectedPhase, interactionVersion) {
-    const data = this.versions.get(this._key(sessionKey));
-
-    if (!data) {
-      return { valid: false, reason: 'No version data for this session.' };
+    getVersion(sessionId) {
+        const row = db.prepare('SELECT version FROM phase_version WHERE game_id = ?').get(sessionId);
+        return row ? row.version : 0;
     }
 
-    if (data.phase !== expectedPhase) {
-      return {
-        valid: false,
-        reason: `Phase mismatch: expected ${expectedPhase}, current ${data.phase}.`,
-      };
+    isValid(sessionId, version) {
+        const current = this.getVersion(sessionId);
+        return version === current;
     }
 
-    if (data.version !== interactionVersion) {
-      return {
-        valid: false,
-        reason: `Version mismatch: expected ${data.version}, got ${interactionVersion}.`,
-        currentVersion: data.version,
-      };
+    incrementVersion(sessionId) {
+        const current = this.getVersion(sessionId);
+        db.prepare(
+            'INSERT OR REPLACE INTO phase_version (game_id, version) VALUES (?, ?)'
+        ).run(sessionId, current + 1);
+        logger.debug(`Version incremented for ${sessionId}: ${current} -> ${current + 1}`);
     }
 
-    return { valid: true };
-  }
-
-  initSession(sessionKey, initialPhase) {
-    this.incrementVersion(sessionKey, initialPhase);
-  }
-
-  removeSession(sessionKey) {
-    this.versions.delete(this._key(sessionKey));
-    logger.debug(`Removed versioning for session ${sessionKey}`);
-  }
-
-  getAllSessions() {
-    return Array.from(this.versions.entries()).map(([key, data]) => ({
-      sessionKey: key,
-      ...data,
-    }));
-  }
-
-  clear() {
-    this.versions.clear();
-  }
+    getCustomId(sessionId, action, target) {
+        const version = this.getVersion(sessionId);
+        return `${sessionId}_${version}_${action}_${target}`;
+    }
 }
 
-module.exports = new InteractionVersioning();
+module.exports = InteractionVersioning;

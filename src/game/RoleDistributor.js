@@ -1,77 +1,40 @@
-const config = require('../../config');
+const config = require('../../config/config');
 const logger = require('../utils/logger');
 
 class RoleDistributor {
-  static distribute(playerCount) {
-    if (playerCount < 4) {
-      throw new Error('Minimum 4 players required.');
+    distribute(players) {
+        const count = players.length;
+        let wolfCount = config.WEREWOLF_COUNTS['8-16'];
+        if (count >= 6 && count <= 7) wolfCount = config.WEREWOLF_COUNTS['6-7'];
+        else if (count >= 4 && count <= 5) wolfCount = config.WEREWOLF_COUNTS['4-5'];
+
+        const availableSpecials = [...config.UNIQUE_ROLES_LIST];
+        const assignedSpecials = [];
+
+        const maxSpecials = Math.max(0, count - wolfCount - 1);
+        for (let i = 0; i < Math.min(availableSpecials.length, maxSpecials); i++) {
+            const idx = Math.floor(Math.random() * availableSpecials.length);
+            assignedSpecials.push(availableSpecials.splice(idx, 1)[0]);
+        }
+
+        const roles = [];
+        for (let i = 0; i < wolfCount; i++) roles.push('werewolf');
+        assignedSpecials.forEach(r => roles.push(r));
+        while (roles.length < count) roles.push('villager');
+
+        for (let i = roles.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [roles[i], roles[j]] = [roles[j], roles[i]];
+        }
+
+        const roleMap = new Map();
+        players.forEach((p, i) => {
+            roleMap.set(p.id, roles[i] || 'villager');
+        });
+
+        logger.info(`Roles distributed: ${wolfCount} wolves, ${assignedSpecials.length} specials, ${count - wolfCount - assignedSpecials.length} villagers`);
+        return roleMap;
     }
-    if (playerCount > config.MAX_PLAYERS) {
-      throw new Error(`Maximum ${config.MAX_PLAYERS} players allowed.`);
-    }
-
-    const wolfCount = config.WEREWOLF_COUNTS[playerCount] || 2;
-    const uniqueRoles = [...config.UNIQUE_ROLES_LIST];
-    const shuffledUnique = RoleDistributor.shuffle(uniqueRoles);
-
-    const roles = [];
-    for (let i = 0; i < wolfCount; i++) {
-      roles.push('Werewolf');
-    }
-
-    const remaining = playerCount - wolfCount;
-    const uniqueCount = Math.min(remaining, shuffledUnique.length);
-
-    for (let i = 0; i < uniqueCount; i++) {
-      roles.push(shuffledUnique[i]);
-    }
-
-    const villagerCount = remaining - uniqueCount;
-    for (let i = 0; i < villagerCount; i++) {
-      roles.push('Villager');
-    }
-
-    const shuffledRoles = RoleDistributor.shuffle(roles);
-
-    logger.info(
-      `Distributed ${playerCount} roles: ${wolfCount} wolves, ${uniqueCount} unique, ${villagerCount} villagers.`,
-    );
-
-    return shuffledRoles;
-  }
-
-  static distributeToPlayers(players) {
-    const roles = RoleDistributor.distribute(players.length);
-    const shuffledPlayers = RoleDistributor.shuffle([...players]);
-
-    const assignments = [];
-    for (let i = 0; i < shuffledPlayers.length; i++) {
-      assignments.push({
-        userId: shuffledPlayers[i].userId || shuffledPlayers[i].id,
-        username: shuffledPlayers[i].username,
-        displayAvatarURL: shuffledPlayers[i].displayAvatarURL || shuffledPlayers[i].avatarURL || '',
-        role: roles[i],
-        isAlive: true,
-      });
-    }
-
-    return assignments;
-  }
-
-  static getUniqueAssignedCount(playerCount) {
-    const wolfCount = config.WEREWOLF_COUNTS[playerCount] || 2;
-    const remaining = playerCount - wolfCount;
-    return Math.min(remaining, config.UNIQUE_ROLES_LIST.length);
-  }
-
-  static shuffle(array) {
-    const arr = [...array];
-    for (let i = arr.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [arr[i], arr[j]] = [arr[j], arr[i]];
-    }
-    return arr;
-  }
 }
 
-module.exports = RoleDistributor;
+module.exports = new RoleDistributor();

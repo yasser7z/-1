@@ -1,318 +1,162 @@
-const config = require('../../config');
-const { getDb, execute } = require('../../database/db');
+const db = require('../../database/db');
+const config = require('../../config/config');
 const logger = require('../utils/logger');
 const LobbyUIManager = require('./LobbyUIManager');
-const GameInitializer = require('../core/GameInitializer');
-const sessionManager = require('../core/SessionManager');
-const RecoveryService = require('../core/RecoveryService');
-const { botCanSend, botCanEmbed } = require('../utils/permissions');
-const locale = require('../locales/ar');
+const LobbyButtons = require('./LobbyButtons');
+const { ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
 
 class LobbyManager {
-  constructor() {
-    this.lobbies = new Map();
-    this.countdownTimers = new Map();
-    this.updateQueues = new Map();
-  }
-
-  async createLobby(guildId, channelId, hostId, channel, persist = true) {
-    const key = this._key(guildId, channelId);
-
-    if (this.lobbies.has(key)) {
-      logger.warn(`Lobby already exists: ${key}`);
-      return this.lobbies.get(key);
+    constructor(client) {
+        this.client = client;
+        this.lobbies = new Map();
     }
 
-    const lobby = {
-      guildId,
-      channelId,
-      hostId,
-      players: [],
-      status: 'open',
-      countdownActive: false,
-      countdownTimeLeft: config.PHASE_DURATIONS.LOBBY_COUNTDOWN,
-      messageId: null,
-      message: null,
-      channel,
-      createdAt: Date.now(),
-      lastActivity: Date.now(),
-      phaseStartTimestamp: null,
-      cancelled: false,
+    async createLobby(channel) {
+        const key = `${channel.guildId}_${channel.id}`;
+        if (this.lobbies.has(key)) return null;
 
-      markAsUpdated() {
-        this.lastActivity = Date.now();
-      },
-    };
+        const lobby = {
+            channel,
+            guildId: channel.guildId,
+            channelId: channel.id,
+            players: [],
+            countdown: null,
+            inactivityTimer: null,
+            autoStartTimer: null,
+            lastActivity: Date.now(),
+            message: null,
+            started: false
+        };
 
-    lobby.players.push({
-      userId: hostId,
-      username: channel.guild.members.me?.user?.username || 'Host',
-      displayAvatarURL: '',
-    });
-
-    this.lobbies.set(key, lobby);
-
-    if (persist) {
-      await RecoveryService.saveLobbyToDb(lobby);
-    }
-
-    logger.info(`Lobby created: ${key}`);
-    return lobby;
-  }
-
-  getLobby(guildId, channelId) {
-    return this.lobbies.get(this._key(guildId, channelId)) || null;
-  }
-
-  async updateLobbyEmbed(guildId, channelId) {
-    const lobby = this.getLobby(guildId, channelId);
-    if (!lobby || !lobby.channel) return;
-
-    if (!botCanSend(lobby.channel) || !botCanEmbed(lobby.channel)) {
-      logger.warn(`Cannot update embed - missing permissions in #${channelId}`);
-      return;
-    }
-
-    const isAdmin = false;
-    const embed = LobbyUIManager.buildEmbed(lobby);
-    const components = LobbyUIManager.buildComponents(lobby, isAdmin);
-
-    try {
-      if (lobby.message) {
-        await lobby.message.edit({ embeds: [embed], components });
-      } else if (lobby.messageId) {
-        try {
-          const msg = await lobby.channel.messages.fetch(lobby.messageId);
-          lobby.message = msg;
-          await msg.edit({ embeds: [embed], components });
-        } catch {
-          const msg = await lobby.channel.send({ embeds: [embed], components });
-          lobby.message = msg;
-          lobby.messageId = msg.id;
-          await RecoveryService.saveLobbyToDb(lobby);
-        }
-      } else {
-        const msg = await lobby.channel.send({ embeds: [embed], components });
+        const embed = LobbyUIManager.buildLobbyEmbed(lobby);
+        const row = LobbyButtons.createActionRow();
+        const msg = await channel.send({ embeds: [embed], components: [row] });
         lobby.message = msg;
-        lobby.messageId = msg.id;
-        await RecoveryService.saveLobbyToDb(lobby);
-      }
-    } catch (error) {
-      logger.error({ err: error }, `Failed to update lobby embed in #${channelId}`);
-    }
-  }
 
-  async checkAutoStart(guildId, channelId) {
-    const lobby = this.getLobby(guildId, channelId);
-    if (!lobby) return;
+        this.lobbies.set(key, lobby);
+        this._resetInactivityTimer(lobby);
 
-    if (lobby.players.length >= 4 && !lobby.countdownActive && !lobby.cancelled) {
-      await this.startCountdown(guildId, channelId);
-    }
-  }
+        const stmt = db.prepare('INSERT OR REPLACE INTO lobby_data (guild_id, channel_id, player_count) VALUES (?, ?, ?)');
+        stmt.run(lobby.guildId, lobby.channelId, 0);
 
-  async startCountdown(guildId, channelId) {
-    const lobby = this.getLobby(guildId, channelId);
-    if (!lobby || lobby.countdownActive) return;
-
-    lobby.countdownActive = true;
-    lobby.countdownTimeLeft = config.PHASE_DURATIONS.LOBBY_COUNTDOWN;
-    lobby.markAsUpdated();
-
-    logger.info(`Countdown started for lobby: ${this._key(guildId, channelId)}`);
-
-    const key = this._key(guildId, channelId);
-
-    if (this.countdownTimers.has(key)) {
-      clearInterval(this.countdownTimers.get(key));
+        logger.info(`Lobby created in ${channel.guildId}_${channel.id}`);
+        return lobby;
     }
 
-    const interval = setInterval(async () => {
-      const currentLobby = this.getLobby(guildId, channelId);
-      if (!currentLobby || !currentLobby.countdownActive) {
-        clearInterval(interval);
-        this.countdownTimers.delete(key);
-        return;
-      }
+    async addPlayer(user, lobby) {
+        const key = `${lobby.guildId}_${lobby.channelId}`;
+        if (!this.lobbies.has(key)) return { success: false, reason: 'no_lobby' };
+        if (lobby.players.length >= config.MAX_PLAYERS) return { success: false, reason: 'max_players' };
+        if (lobby.players.find(p => p.id === user.id)) return { success: false, reason: 'already_joined' };
+        if (lobby.started) return { success: false, reason: 'already_started' };
 
-      currentLobby.countdownTimeLeft -= 1000;
-      currentLobby.markAsUpdated();
+        lobby.players.push({ id: user.id, username: user.username, displayAvatarURL: user.displayAvatarURL() });
+        lobby.lastActivity = Date.now();
 
-      if (currentLobby.players.length < 4) {
-        clearInterval(interval);
-        this.countdownTimers.delete(key);
-        await this.cancelCountdown(guildId, channelId, 'العدد غير مكتمل');
-        return;
-      }
-
-      if (currentLobby.countdownTimeLeft <= 0) {
-        clearInterval(interval);
-        this.countdownTimers.delete(key);
-        await this.endCountdown(guildId, channelId);
-        return;
-      }
-
-      if (currentLobby.countdownTimeLeft % 10000 === 0 || currentLobby.countdownTimeLeft <= 10000) {
-        await this.updateLobbyEmbed(guildId, channelId);
-      }
-    }, 1000);
-
-    this.countdownTimers.set(key, interval);
-    await this.updateLobbyEmbed(guildId, channelId);
-  }
-
-  async cancelCountdown(guildId, channelId, reason = '') {
-    const lobby = this.getLobby(guildId, channelId);
-    if (!lobby) return;
-
-    lobby.countdownActive = false;
-    lobby.countdownTimeLeft = config.PHASE_DURATIONS.LOBBY_COUNTDOWN;
-    lobby.markAsUpdated();
-
-    const key = this._key(guildId, channelId);
-    if (this.countdownTimers.has(key)) {
-      clearInterval(this.countdownTimers.get(key));
-      this.countdownTimers.delete(key);
+        this._updateLobbyData(lobby);
+        await this.updateEmbed(lobby);
+        this._manageAutoStart(lobby);
+        this._resetInactivityTimer(lobby);
+        return { success: true };
     }
 
-    logger.info(`Countdown cancelled for ${key}${reason ? `: ${reason}` : ''}`);
+    async removePlayer(user, lobby) {
+        const key = `${lobby.guildId}_${lobby.channelId}`;
+        if (!this.lobbies.has(key)) return { success: false, reason: 'no_lobby' };
+        if (lobby.started) return { success: false, reason: 'already_started' };
 
-    const embed = LobbyUIManager.buildIncompleteEmbed(lobby);
-    const components = LobbyUIManager.buildComponents(lobby, false);
-    if (lobby.message) {
-      await lobby.message.edit({ embeds: [embed], components }).catch(() => {});
-    }
-  }
+        const idx = lobby.players.findIndex(p => p.id === user.id);
+        if (idx === -1) return { success: false, reason: 'not_in_lobby' };
 
-  async endCountdown(guildId, channelId) {
-    const lobby = this.getLobby(guildId, channelId);
-    if (!lobby) return;
+        lobby.players.splice(idx, 1);
+        lobby.lastActivity = Date.now();
 
-    lobby.countdownActive = false;
-    lobby.markAsUpdated();
-
-    logger.info(`Countdown ended for ${this._key(guildId, channelId)}`);
-
-    if (!botCanSend(lobby.channel) || !botCanEmbed(lobby.channel)) {
-      logger.error(`Bot lacks permissions in #${channelId}. Aborting game start.`);
-      if (lobby.message) {
-        await lobby.message.edit({
-          content: `${locale.ERRORS.CHANNEL_PERMISSION} تعذر بدء اللعبة.`,
-          embeds: [],
-          components: [],
-        }).catch(() => {});
-      }
-      return;
+        this._updateLobbyData(lobby);
+        await this.updateEmbed(lobby);
+        this._manageAutoStart(lobby);
+        this._resetInactivityTimer(lobby);
+        return { success: true };
     }
 
-    const playerCount = lobby.players.length;
-    if (playerCount < 4 || playerCount > config.MAX_PLAYERS) {
-      logger.warn(`Cannot start game: ${playerCount} players (need 4-${config.MAX_PLAYERS})`);
-      await this.cancelCountdown(guildId, channelId, 'عدد اللاعبين غير مناسب');
-      return;
+    async updateEmbed(lobby) {
+        const embed = LobbyUIManager.buildLobbyEmbed(lobby);
+        const row = LobbyButtons.createActionRow();
+        try {
+            await lobby.message.edit({ embeds: [embed], components: [row] });
+        } catch (err) {
+            logger.error(`Failed to update lobby embed: ${err.message}`);
+        }
     }
 
-    if (lobby.message) {
-      await lobby.message.delete().catch(() => {});
-      lobby.message = null;
-      lobby.messageId = null;
+    startCountdown(lobby) {
+        if (lobby.countdown) return;
+
+        lobby.countdown = config.LOBBY_AUTO_START_DELAY / 1000;
+        const key = `${lobby.guildId}_${lobby.channelId}`;
+
+        lobby.autoStartTimer = setInterval(async () => {
+            lobby.countdown--;
+            await this.updateEmbed(lobby);
+
+            if (lobby.countdown <= 0) {
+                clearInterval(lobby.autoStartTimer);
+                lobby.autoStartTimer = null;
+                lobby.countdown = null;
+                lobby.started = true;
+                this._resetInactivityTimer(lobby);
+                logger.info(`Auto-start triggered for lobby ${key}`);
+            }
+        }, 1000);
     }
 
-    try {
-      const players = lobby.players.map(p => ({
-        userId: p.userId,
-        username: p.username,
-        displayAvatarURL: p.displayAvatarURL || '',
-      }));
-
-      const session = GameInitializer.initialize(players, guildId, channelId);
-      session.channel = channel;
-      sessionManager.set(session);
-
-      await RecoveryService.markSessionInGame(guildId, channelId);
-
-      this.lobbies.delete(this._key(guildId, channelId));
-
-      const PhaseManager = require('../game/PhaseManager');
-      const nightActionCollector = require('../night/NightActionCollector');
-
-      await PhaseManager.startGame(session);
-      await nightActionCollector.startCollection(session, channel);
-
-      logger.info(`Game started successfully in #${channelId}`);
-    } catch (error) {
-      logger.error({ err: error }, 'Failed to initialize game.');
-      await channel.send({
-        content: `❌ فشل بدء اللعبة: ${error.message}`,
-      }).catch(() => {});
-    }
-  }
-
-  checkPlayerCount(guildId, channelId) {
-    const lobby = this.getLobby(guildId, channelId);
-    if (!lobby) return;
-
-    if (lobby.players.length < 4 && lobby.countdownActive) {
-      this.cancelCountdown(guildId, channelId, 'العدد غير مكتمل');
-    }
-  }
-
-  async cancelLobby(guildId, channelId) {
-    const lobby = this.getLobby(guildId, channelId);
-    if (!lobby) return;
-
-    lobby.cancelled = true;
-    lobby.countdownActive = false;
-
-    const key = this._key(guildId, channelId);
-    if (this.countdownTimers.has(key)) {
-      clearInterval(this.countdownTimers.get(key));
-      this.countdownTimers.delete(key);
+    cancelCountdown(lobby) {
+        if (lobby.autoStartTimer) {
+            clearInterval(lobby.autoStartTimer);
+            lobby.autoStartTimer = null;
+        }
+        lobby.countdown = null;
     }
 
-    if (lobby.message) {
-      try {
-        await lobby.message.edit({
-          content: '🚫 تم إلغاء اللوبي.',
-          embeds: [],
-          components: [],
-        });
-      } catch {}
+    async deleteLobby(lobby, reason = 'inactivity') {
+        const key = `${lobby.guildId}_${lobby.channelId}`;
+        this.cancelCountdown(lobby);
+        if (lobby.inactivityTimer) clearTimeout(lobby.inactivityTimer);
+        this.lobbies.delete(key);
+
+        const stmt = db.prepare('DELETE FROM lobby_data WHERE guild_id = ? AND channel_id = ?');
+        stmt.run(lobby.guildId, lobby.channelId);
+
+        try {
+            if (reason === 'inactivity') {
+                await lobby.channel.send({ content: 'انتهت صلاحية اللوبي بسبب عدم النشاط.' });
+            }
+            await lobby.message.delete().catch(() => {});
+        } catch (err) {
+            logger.error(`Failed to delete lobby message: ${err.message}`);
+        }
+
+        logger.info(`Lobby ${key} deleted due to ${reason}`);
     }
 
-    this.lobbies.delete(key);
-    await RecoveryService.closeSession(guildId, channelId);
-    logger.info(`Lobby cancelled: ${key}`);
-  }
-
-  deleteLobby(guildId, channelId) {
-    const key = this._key(guildId, channelId);
-
-    if (this.countdownTimers.has(key)) {
-      clearInterval(this.countdownTimers.get(key));
-      this.countdownTimers.delete(key);
+    _resetInactivityTimer(lobby) {
+        if (lobby.inactivityTimer) clearTimeout(lobby.inactivityTimer);
+        lobby.inactivityTimer = setTimeout(() => {
+            if (!lobby.started) this.deleteLobby(lobby, 'inactivity');
+        }, config.LOBBY_INACTIVITY_TIMEOUT);
     }
 
-    this.lobbies.delete(key);
-    logger.info(`Lobby deleted: ${key}`);
-  }
-
-  hasActiveLobby(guildId, channelId) {
-    return this.lobbies.has(this._key(guildId, channelId));
-  }
-
-  _key(guildId, channelId) {
-    return `${guildId}_${channelId}`;
-  }
-
-  cleanup() {
-    for (const [key, timer] of this.countdownTimers) {
-      clearInterval(timer);
+    _manageAutoStart(lobby) {
+        if (lobby.players.length >= 4) {
+            if (!lobby.autoStartTimer) this.startCountdown(lobby);
+        } else {
+            this.cancelCountdown(lobby);
+        }
     }
-    this.countdownTimers.clear();
-    this.lobbies.clear();
-    logger.info('LobbyManager cleaned up all lobbies.');
-  }
+
+    _updateLobbyData(lobby) {
+        const stmt = db.prepare('INSERT OR REPLACE INTO lobby_data (guild_id, channel_id, player_count) VALUES (?, ?, ?)');
+        stmt.run(lobby.guildId, lobby.channelId, lobby.players.length);
+    }
 }
 
-module.exports = new LobbyManager();
+module.exports = LobbyManager;

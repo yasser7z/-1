@@ -1,180 +1,131 @@
 const logger = require('../utils/logger');
-const cooldown = require('../utils/cooldown');
-const rateLimitGuard = require('../security/RateLimitGuard');
-const lobbyButtons = require('../lobby/LobbyButtons');
-const nightActionCollector = require('../night/NightActionCollector');
-const sessionManager = require('../core/SessionManager');
-const locale = require('../locales/ar');
+const ActionLockManager = require('../security/ActionLockManager');
+const InteractionVersioning = require('../security/InteractionVersioning');
+const RateLimitGuard = require('../security/RateLimitGuard');
 
-const BUTTON_COOLDOWN = 500;
+const roleActionMapping = {
+    werewolf: ['night_kill'],
+    investigator: ['night_investigate'],
+    bodyguard: ['night_protect'],
+    doctor: ['night_heal'],
+    seductress: ['night_seduce'],
+    umzaki: ['night_umzaki'],
+    king: ['day_veto'],
+    mayor: ['day_vote'],
+    villager: ['day_vote']
+};
 
 class InteractionRouter {
-  constructor() {
-    this.handlers = new Map();
-    this._registerHandlers();
-  }
-
-  _registerHandlers() {
-    this.handlers.set('lobby_join', {
-      handler: (i) => lobbyButtons.handle(i),
-      requiresSession: false,
-      requiresAlive: false,
-    });
-
-    this.handlers.set('lobby_leave', {
-      handler: (i) => lobbyButtons.handle(i),
-      requiresSession: false,
-      requiresAlive: false,
-    });
-
-    this.handlers.set('lobby_cancel', {
-      handler: (i) => lobbyButtons.handle(i),
-      requiresSession: false,
-      requiresAlive: false,
-    });
-
-    this.handlers.set('night_panel', {
-      handler: (i) => nightActionCollector.handleNightInteraction(i),
-      requiresSession: true,
-      requiresAlive: true,
-      phase: 'NIGHT',
-    });
-
-    this.handlers.set('night_KILL', {
-      handler: (i) => nightActionCollector.handleNightInteraction(i),
-      requiresSession: true,
-      requiresAlive: true,
-      phase: 'NIGHT',
-    });
-
-    this.handlers.set('night_INVESTIGATE', {
-      handler: (i) => nightActionCollector.handleNightInteraction(i),
-      requiresSession: true,
-      requiresAlive: true,
-      phase: 'NIGHT',
-    });
-
-    this.handlers.set('night_PROTECT', {
-      handler: (i) => nightActionCollector.handleNightInteraction(i),
-      requiresSession: true,
-      requiresAlive: true,
-      phase: 'NIGHT',
-    });
-
-    this.handlers.set('night_SAVE', {
-      handler: (i) => nightActionCollector.handleNightInteraction(i),
-      requiresSession: true,
-      requiresAlive: true,
-      phase: 'NIGHT',
-    });
-
-    this.handlers.set('night_BLOCK', {
-      handler: (i) => nightActionCollector.handleNightInteraction(i),
-      requiresSession: true,
-      requiresAlive: true,
-      phase: 'NIGHT',
-    });
-
-    this.handlers.set('night_SILENCE', {
-      handler: (i) => nightActionCollector.handleNightInteraction(i),
-      requiresSession: true,
-      requiresAlive: true,
-      phase: 'NIGHT',
-    });
-  }
-
-  async route(interaction) {
-    if (!interaction.isButton()) return;
-
-    const customId = interaction.customId;
-    const userId = interaction.user.id;
-    const guildId = interaction.guildId;
-    const channelId = interaction.channelId;
-    const sessionKey = `${guildId}_${channelId}`;
-
-    if (rateLimitGuard.isMuted(userId)) {
-      const timeLeft = Math.ceil(rateLimitGuard.getMutedTimeLeft(userId) / 1000);
-      if (interaction.deferred || interaction.replied) return;
-      return interaction.reply({
-        content: `🛑 أنت مكتوم لمدة ${timeLeft} ثانية.`,
-        ephemeral: true,
-      });
+    constructor(client) {
+        this.client = client;
+        this.actionLockManager = new ActionLockManager();
+        this.interactionVersioning = new InteractionVersioning();
+        this.rateLimitGuard = new RateLimitGuard();
     }
 
-    if (cooldown.check(userId, customId, BUTTON_COOLDOWN)) {
-      return;
-    }
+    async route(interaction) {
+        if (!interaction.customId) return;
 
-    const prefix = customId.split('_').slice(0, 2).join('_');
-    const firstPrefix = customId.split('_')[0] === 'night'
-      ? customId.split('_').slice(0, 2).join('_')
-      : customId.split('_')[0];
+        const parts = interaction.customId.split('_');
+        if (parts.length < 4) return;
 
-    const handlerKey = customId.startsWith('night_')
-      ? customId.split('_').slice(0, 2).join('_')
-      : customId.split('_')[0];
+        const sessionId = parts[0];
+        const phaseVersion = parseInt(parts[1], 10);
+        const action = parts[2];
+        const target = parts.slice(3).join('_');
 
-    const handlerConfig = this.handlers.get(handlerKey) || this.handlers.get(firstPrefix);
+        const userId = interaction.user.id;
 
-    if (!handlerConfig) {
-      return;
-    }
-
-    cooldown.set(userId, customId);
-
-    if (handlerConfig.requiresSession) {
-      const session = sessionManager.get(guildId, channelId);
-      if (!session || !session.isActive) {
-        rateLimitGuard.recordClick(userId, false);
-        return interaction.reply({
-          content: '❌ لا توجد جلسة نشطة.',
-          ephemeral: true,
-        });
-      }
-
-      if (handlerConfig.requiresAlive) {
-        const player = session.getPlayer(userId);
-        if (!player || !player.isAlive) {
-          rateLimitGuard.recordClick(userId, false);
-          return interaction.reply({
-            content: '❌ أنت ميت أو لست في اللعبة.',
-            ephemeral: true,
-          });
+        if (this.rateLimitGuard.isRateLimited(userId)) {
+            return interaction.reply({ content: '❌ أنت مقيد مؤقتاً بسبب النقرات المتكررة.', ephemeral: true });
         }
-      }
 
-      if (handlerConfig.phase) {
-        const currentPhase = session.stateMachine.getState();
-        if (currentPhase !== handlerConfig.phase) {
-          rateLimitGuard.recordClick(userId, false);
-          return interaction.reply({
-            content: `❌ هذه الأزرار خاصة بمرحلة ${handlerConfig.phase}، المرحلة الحالية: ${currentPhase}.`,
-            ephemeral: true,
-          });
+        const session = this.client.sessionManager.get(sessionId);
+        if (!session) {
+            this.rateLimitGuard.recordFailure(userId);
+            return interaction.reply({ content: '❌ الجلسة غير موجودة.', ephemeral: true });
         }
-      }
+
+        if (!this.interactionVersioning.isValid(sessionId, phaseVersion)) {
+            this.rateLimitGuard.recordFailure(userId);
+            return interaction.reply({ content: '❌ انتهت صلاحية هذا الإجراء.', ephemeral: true });
+        }
+
+        const player = session.players.get(userId);
+        if (!player) {
+            this.rateLimitGuard.recordFailure(userId);
+            return interaction.reply({ content: '❌ أنت لست في هذه اللعبة.', ephemeral: true });
+        }
+
+        if (!player.isAlive) {
+            return interaction.reply({ content: '❌ أنت ميت ولا يمكنك تنفيذ إجراءات.', ephemeral: true });
+        }
+
+        const allowed = roleActionMapping[player.role] || [];
+        if (!allowed.includes(action)) {
+            this.rateLimitGuard.recordFailure(userId);
+            return interaction.reply({ content: '❌ دورك لا يسمح بهذا الإجراء.', ephemeral: true });
+        }
+
+        if (this.actionLockManager.isLocked(sessionId, userId, action)) {
+            return interaction.reply({ content: '❌ لقد قمت بالفعل بهذا الإجراء.', ephemeral: true });
+        }
+
+        const handler = this.getHandler(action);
+        if (!handler) {
+            logger.error(`No handler for action: ${action}`);
+            return interaction.reply({ content: '❌ حدث خطأ.', ephemeral: true });
+        }
+
+        try {
+            await handler(interaction, session, userId, target);
+            this.actionLockManager.acquireLock(sessionId, userId, action);
+            this.rateLimitGuard.resetFailures(userId);
+        } catch (err) {
+            logger.error(`Action handler error: ${err.message}`);
+            if (!interaction.replied) {
+                await interaction.reply({ content: '❌ حدث خطأ أثناء تنفيذ الإجراء.', ephemeral: true });
+            }
+        }
     }
 
-    try {
-      await handlerConfig.handler(interaction);
-    } catch (error) {
-      logger.error({ err: error }, `Interaction routing error for ${customId}`);
-      if (!interaction.replied && !interaction.deferred) {
-        await interaction.reply({
-          content: '❌ حدث خطأ أثناء معالجة طلبك.',
-          ephemeral: true,
-        }).catch(() => {});
-      } else if (interaction.deferred) {
-        await interaction.editReply({
-          content: '❌ حدث خطأ أثناء معالجة طلبك.',
-        }).catch(() => {});
-      }
+    getHandler(action) {
+        const handlers = {
+            night_kill: async (i, s, uid, t) => {
+                s.nightActions.set(uid, t);
+                await i.reply({ content: '✅ تم تحديد هدفك لهذه الليلة.', ephemeral: true });
+            },
+            night_investigate: async (i, s, uid, t) => {
+                s.nightActions.set(uid, t);
+                await i.reply({ content: '✅ جاري التحقيق في الهدف.', ephemeral: true });
+            },
+            night_protect: async (i, s, uid, t) => {
+                s.nightActions.set(uid, t);
+                await i.reply({ content: '✅ يتم حماية الهدف الآن.', ephemeral: true });
+            },
+            night_heal: async (i, s, uid, t) => {
+                s.nightActions.set(uid, t);
+                await i.reply({ content: '✅ تم شفاء الهدف.', ephemeral: true });
+            },
+            night_seduce: async (i, s, uid, t) => {
+                s.nightActions.set(uid, t);
+                await i.reply({ content: '✅ تم إغراء الهدف.', ephemeral: true });
+            },
+            night_umzaki: async (i, s, uid, t) => {
+                s.nightActions.set(uid, t);
+                await i.reply({ content: '✅ تم تنفيذ قدرة أم زاكي.', ephemeral: true });
+            },
+            day_veto: async (i, s, uid, t) => {
+                s.vetoTarget = t;
+                await i.reply({ content: '✅ تم استخدام حق النقض.', ephemeral: true });
+            },
+            day_vote: async (i, s, uid, t) => {
+                s.votes.set(uid, t);
+                await i.reply({ content: '✅ تم تسجيل صوتك.', ephemeral: true });
+            }
+        };
+        return handlers[action];
     }
-  }
-
-  registerHandler(pattern, config) {
-    this.handlers.set(pattern, config);
-  }
 }
 
-module.exports = new InteractionRouter();
+module.exports = InteractionRouter;

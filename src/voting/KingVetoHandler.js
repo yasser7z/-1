@@ -1,128 +1,87 @@
-const { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, StringSelectMenuBuilder } = require('discord.js');
-const colors = require('../constants/colors');
-const emojis = require('../constants/emojis');
+const { ActionRowBuilder, StringSelectMenuBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+const ActionLockManager = require('../security/ActionLockManager');
 const logger = require('../utils/logger');
-const sessionManager = require('../core/SessionManager');
-const voteCollector = require('./VoteCollector');
-const PhaseManager = require('../game/PhaseManager');
 
 class KingVetoHandler {
-  async sendVetoButton(gameSession, channel) {
-    const king = gameSession.getPlayersByRole('King')[0];
-    if (!king || !king.isAlive) return null;
-
-    const row = new ActionRowBuilder().addComponents(
-      new ButtonBuilder()
-        .setCustomId('king_veto_show')
-        .setLabel('👑 فيتو ملكي')
-        .setStyle(ButtonStyle.Danger),
-    );
-
-    await channel.send({
-      content: `👑 <@${king.userId}>، أنت الملك. لديك صلاحية الفيتو!`,
-      components: [row],
-    });
-
-    return king.userId;
-  }
-
-  async handleVetoShow(interaction) {
-    const userId = interaction.user.id;
-    const guildId = interaction.guildId;
-    const channelId = interaction.channelId;
-
-    const gameSession = sessionManager.get(guildId, channelId);
-    if (!gameSession) {
-      return interaction.reply({ content: '❌ لا توجد لعبة.', ephemeral: true });
+    constructor() {
+        this.lockManager = new ActionLockManager();
     }
 
-    const king = gameSession.getPlayer(userId);
-    if (!king || king.role !== 'King' || !king.isAlive) {
-      return interaction.reply({ content: '❌ أنت لست الملك أو ميت.', ephemeral: true });
+    async showVetoButton(session, channel) {
+        const king = Array.from(session.players.values()).find(p => p.role === 'king' && p.isAlive);
+        if (!king) return;
+
+        const row = new ActionRowBuilder().addComponents(
+            new ButtonBuilder()
+                .setCustomId('king_veto')
+                .setLabel('👑 فيتو')
+                .setStyle(ButtonStyle.Danger)
+        );
+
+        try {
+            const msg = await channel.send({ content: `<@${king.id}>`, components: [row] });
+            setTimeout(() => {
+                msg.delete().catch(() => {});
+            }, 30000);
+        } catch (err) {
+            logger.error(`Failed to show veto button: ${err.message}`);
+        }
     }
 
-    const phase = gameSession.stateMachine.getState();
-    if (phase !== 'DAY_VOTE') {
-      return interaction.reply({ content: '❌ يمكنك استخدام الفيتو فقط أثناء التصويت.', ephemeral: true });
+    async handleVeto(interaction, session) {
+        const userId = interaction.user.id;
+        const player = session.players.get(userId);
+
+        if (!player || player.role !== 'king') {
+            return interaction.reply({ content: '❌ هذا الأمر مخصص للملك فقط.', ephemeral: true });
+        }
+
+        const key = `${session.guildId}_${session.channelId}`;
+        if (this.lockManager.isLocked(key, userId, 'day_veto')) {
+            return interaction.reply({ content: '❌ لقد استخدمت حق النقض مسبقاً.', ephemeral: true });
+        }
+
+        const alivePlayers = Array.from(session.players.values()).filter(p => p.isAlive && p.id !== userId);
+        const options = alivePlayers.map(p => ({
+            label: p.username,
+            value: p.id
+        }));
+
+        if (options.length === 0) {
+            return interaction.reply({ content: '❌ لا يوجد لاعبون أحياء لاستهدافهم.', ephemeral: true });
+        }
+
+        const select = new StringSelectMenuBuilder()
+            .setCustomId('veto_select')
+            .setPlaceholder('اختر اللاعب لإقصائه')
+            .addOptions(options.slice(0, 25));
+
+        const row = new ActionRowBuilder().addComponents(select);
+        await interaction.reply({ content: '👑 اختر اللاعب الذي تريد إقصاءه:', components: [row], ephemeral: true });
+
+        this.lockManager.acquireLock(key, userId, 'day_veto');
     }
 
-    const alive = gameSession.getAlivePlayers().filter(p => p.userId !== userId);
-    if (alive.length === 0) {
-      return interaction.reply({ content: '❌ لا توجد أهداف متاحة.', ephemeral: true });
+    async handleVetoSelect(interaction, session) {
+        const targetId = interaction.values[0];
+        const target = session.players.get(targetId);
+
+        if (target) {
+            target.isAlive = false;
+            session.endPhase();
+
+            if (session.voteMessage) {
+                try {
+                    await session.voteMessage.edit({ components: [] });
+                } catch (e) {}
+            }
+
+            const StateMachine = require('../core/StateMachine');
+            session.transitionTo(StateMachine.states.NIGHT);
+        }
+
+        await interaction.reply({ content: `👑 تم إقصاء ${target?.username || targetId} بأمر الملك.`, ephemeral: true });
     }
-
-    const selectMenu = new StringSelectMenuBuilder()
-      .setCustomId('king_veto_select')
-      .setPlaceholder('اختر هدف الإعدام المباشر')
-      .addOptions(
-        alive.map(p => ({
-          label: p.username.slice(0, 100),
-          value: p.userId,
-          description: `إعدام ${p.username}`,
-        })),
-      );
-
-    const row = new ActionRowBuilder().addComponents(selectMenu);
-    await interaction.reply({ content: '👑 اختر الهدف:', components: [row], ephemeral: true });
-  }
-
-  async handleVetoSelect(interaction) {
-    const userId = interaction.user.id;
-    const targetId = interaction.values[0];
-    const guildId = interaction.guildId;
-    const channelId = interaction.channelId;
-
-    const gameSession = sessionManager.get(guildId, channelId);
-    if (!gameSession) {
-      return interaction.reply({ content: '❌ لا توجد لعبة.', ephemeral: true });
-    }
-
-    const player = gameSession.getPlayer(targetId);
-    if (!player || !player.isAlive) {
-      return interaction.reply({ content: '❌ الهدف ميت.', ephemeral: true });
-    }
-
-    voteCollector.cancelVote(gameSession.sessionKey);
-
-    gameSession.lynchPlayer(targetId);
-    gameSession.clearTimer('vote_phase');
-
-    const embed = new EmbedBuilder()
-      .setColor(colors.GOLD)
-      .setTitle(`👑 أمر ملكي - إعدام فوري`)
-      .setDescription(
-        `الملك <@${userId}> استخدم الفيتو!\n` +
-        `تم إعدام <@${targetId}> فوراً.\n` +
-        `كان دوره: **${player.role}**`
-      )
-      .setTimestamp();
-
-    const channel = interaction.channel;
-    await channel.send({ embeds: [embed] });
-
-    await interaction.update({ content: `✅ تم إعدام <@${targetId}> بأمر ملكي.`, components: [], ephemeral: true });
-
-    logger.info(`King ${userId} vetoed and lynched ${targetId}`);
-
-    const WinConditionChecker = require('../game/WinConditionChecker');
-    const winner = WinConditionChecker.check(gameSession);
-    if (winner) {
-      await PhaseManager.endGame(gameSession, winner);
-    } else {
-      gameSession.round++;
-      gameSession.stateMachine.transitionTo('NIGHT', 'King veto');
-      gameSession.phaseStartTimestamp = Date.now();
-      const nightActionCollector = require('../night/NightActionCollector');
-      if (gameSession.channel) {
-        const aliveList = gameSession.getAlivePlayers().map(p => `<@${p.userId}>`).join(' ');
-        await gameSession.channel.send({
-          content: `🌙 **حل الليل - الليلة ${gameSession.round}**\nأصحاب القدرات يستعدون...\n\n**اللاعبون الأحياء (${gameSession.getAliveCount()})**\n${aliveList}`,
-        }).catch(() => {});
-        await nightActionCollector.startCollection(gameSession, gameSession.channel);
-      }
-      await PhaseManager.runNight(gameSession);
-    }
-  }
 }
 
 module.exports = new KingVetoHandler();

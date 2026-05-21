@@ -1,158 +1,76 @@
 const logger = require('../utils/logger');
 
-const ACTION_ORDER = ['PROTECT', 'SAVE', 'BLOCK', 'KILL'];
-
 class NightResolver {
-  constructor() {
-    this.lastHealed = new Map();
-  }
+    resolve(session) {
+        const actions = session.nightActions;
+        const players = session.players;
+        const alivePlayers = Array.from(players.values()).filter(p => p.isAlive);
 
-  resolve(gameSession) {
-    const round = gameSession.round;
-    const actions = gameSession.getNightActionsForRound(round);
-    const alivePlayers = gameSession.getAlivePlayers();
-    const werewolves = gameSession.getPlayersByRole('Werewolf').filter(p => p.isAlive);
+        const protectedSet = new Set();
+        const healedSet = new Set();
+        let attackTarget = null;
+        let seductressTarget = null;
+        let seductressId = null;
+        let umZakiTriggered = false;
 
-    const result = {
-      killed: null,
-      saved: null,
-      blocked: null,
-      investigated: null,
-      protected: null,
-      silenced: null,
-      autoAttack: false,
-    };
+        for (const [playerId, targetId] of actions) {
+            const player = players.get(playerId);
+            if (!player || !player.isAlive) continue;
 
-    const actionMap = {};
-    for (const action of actions) {
-      if (!actionMap[action.actionType]) {
-        actionMap[action.actionType] = [];
-      }
-      actionMap[action.actionType].push(action);
-    }
-
-    const sessionKey = gameSession.sessionKey;
-
-    if (actionMap['PROTECT']) {
-      const protectAction = actionMap['PROTECT'][0];
-      const protector = gameSession.getPlayer(protectAction.userId);
-      if (protector && protector.isAlive) {
-        result.protected = protectAction.targetId;
-        logger.debug(`Bodyguard ${protectAction.userId} protects ${protectAction.targetId}`);
-      }
-    }
-
-    if (actionMap['SAVE']) {
-      const saveAction = actionMap['SAVE'][0];
-      const doctor = gameSession.getPlayer(saveAction.userId);
-      if (doctor && doctor.isAlive) {
-        const targetKey = `${sessionKey}_${saveAction.targetId}`;
-        const lastHealedRound = this.lastHealed.get(targetKey) || 0;
-
-        if (lastHealedRound === round) {
-          logger.debug(`Doctor cannot heal ${saveAction.targetId} twice in a row.`);
-        } else {
-          result.saved = saveAction.targetId;
-          this.lastHealed.set(targetKey, round);
-          logger.debug(`Doctor ${saveAction.userId} saves ${saveAction.targetId}`);
+            switch (player.role) {
+                case 'bodyguard':
+                    protectedSet.add(targetId);
+                    break;
+                case 'doctor':
+                    healedSet.add(targetId);
+                    break;
+                case 'seductress':
+                    seductressId = playerId;
+                    seductressTarget = targetId;
+                    break;
+                case 'werewolf':
+                    attackTarget = targetId;
+                    break;
+                case 'umzaki':
+                    umZakiTriggered = true;
+                    break;
+            }
         }
-      }
-    }
 
-    if (actionMap['BLOCK']) {
-      const blockAction = actionMap['BLOCK'][0];
-      const seductress = gameSession.getPlayer(blockAction.userId);
-      if (seductress && seductress.isAlive) {
-        result.blocked = blockAction.targetId;
-        logger.debug(`Seductress ${blockAction.userId} blocks ${blockAction.targetId}`);
-      } else if (seductress && !seductress.isAlive) {
-        logger.debug(`Seductress is dead, block action fails.`);
-      }
-    }
-
-    let wolfTarget = null;
-    if (actionMap['KILL'] && actionMap['KILL'].length > 0) {
-      const killActions = actionMap['KILL'];
-      const targetCounts = {};
-      for (const ka of killActions) {
-        const wolf = gameSession.getPlayer(ka.userId);
-        if (wolf && wolf.isAlive) {
-          if (result.blocked === ka.userId) {
-            logger.debug(`Wolf ${ka.userId} is blocked by Seductress, skipping.`);
-            continue;
-          }
-          targetCounts[ka.targetId] = (targetCounts[ka.targetId] || 0) + 1;
+        if (!attackTarget) {
+            const nonWolves = alivePlayers.filter(p => p.role !== 'werewolf');
+            const wolves = alivePlayers.filter(p => p.role === 'werewolf');
+            if (nonWolves.length > 0 && wolves.length > 0) {
+                attackTarget = nonWolves[Math.floor(Math.random() * nonWolves.length)].id;
+                session.nightActions.set(wolves[0].id, attackTarget);
+                logger.info(`Auto-attack: wolf ${wolves[0].id} -> ${attackTarget}`);
+            }
         }
-      }
 
-      const entries = Object.entries(targetCounts);
-      if (entries.length > 0) {
-        entries.sort((a, b) => b[1] - a[1]);
-        wolfTarget = entries[0][0];
-      }
-    }
+        const deaths = [];
 
-    if (!wolfTarget) {
-      const nonWolves = alivePlayers.filter(p => p.role !== 'Werewolf');
-      if (nonWolves.length > 0) {
-        const randomTarget = nonWolves[Math.floor(Math.random() * nonWolves.length)];
-        wolfTarget = randomTarget.userId;
-        result.autoAttack = true;
-        logger.debug(`Auto-attack: random target ${wolfTarget}`);
-      }
-    }
-
-    if (wolfTarget) {
-      if (result.blocked === wolfTarget) {
-        logger.debug(`Attack target ${wolfTarget} is blocked by Seductress, attack fails.`);
-        result.killed = null;
-      } else if (result.protected === wolfTarget) {
-        logger.debug(`Attack target ${wolfTarget} is protected by Bodyguard.`);
-        result.killed = null;
-      } else if (result.saved === wolfTarget) {
-        logger.debug(`Attack target ${wolfTarget} is saved by Doctor.`);
-        result.killed = null;
-      } else {
-        result.killed = wolfTarget;
-      }
-    }
-
-    if (actionMap['INVESTIGATE'] && actionMap['INVESTIGATE'].length > 0) {
-      const invAction = actionMap['INVESTIGATE'][0];
-      const investigator = gameSession.getPlayer(invAction.userId);
-      if (investigator && investigator.isAlive) {
-        const target = gameSession.getPlayer(invAction.targetId);
-        result.investigated = {
-          investigatorId: invAction.userId,
-          targetId: invAction.targetId,
-          isWerewolf: target && target.role === 'Werewolf',
-        };
-        logger.debug(`Investigator ${invAction.userId} checks ${invAction.targetId}: ${target ? target.role : 'unknown'}`);
-      }
-    }
-
-    if (actionMap['SILENCE'] && actionMap['SILENCE'].length > 0) {
-      const silenceAction = actionMap['SILENCE'][0];
-      const umZaki = gameSession.getPlayer(silenceAction.userId);
-      if (umZaki && umZaki.isAlive) {
-        const target = gameSession.getPlayer(silenceAction.targetId);
-        if (target && target.isAlive) {
-          result.silenced = silenceAction.targetId;
-          logger.debug(`Um-Zaki ${silenceAction.userId} silences ${silenceAction.targetId}`);
+        if (seductressId && seductressTarget) {
+            const targetPlayer = players.get(seductressTarget);
+            if (targetPlayer && targetPlayer.role === 'werewolf' && targetPlayer.isAlive) {
+                deaths.push(seductressId);
+            } else if (seductressTarget === attackTarget) {
+                deaths.push(seductressId);
+                attackTarget = null;
+            }
         }
-      }
+
+        if (attackTarget) {
+            if (!protectedSet.has(attackTarget) || !deaths.includes(attackTarget)) {
+                if (!healedSet.has(attackTarget)) {
+                    if (!deaths.includes(attackTarget)) {
+                        deaths.push(attackTarget);
+                    }
+                }
+            }
+        }
+
+        return { deaths: [...new Set(deaths)], umZakiTriggered };
     }
-
-    logger.info(
-      `Night resolved for round ${round}: killed=${result.killed}, saved=${result.saved}, blocked=${result.blocked}, auto=${result.autoAttack}`,
-    );
-
-    return result;
-  }
-
-  resetLastHealed() {
-    this.lastHealed.clear();
-  }
 }
 
 module.exports = new NightResolver();

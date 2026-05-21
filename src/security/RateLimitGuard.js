@@ -1,75 +1,53 @@
 const logger = require('../utils/logger');
 
-const WINDOW_MS = 10000;
-const MAX_INVALID = 5;
-const MUTE_DURATION = 30000;
-
 class RateLimitGuard {
-  constructor() {
-    this.records = new Map();
-    this._cleanupInterval = setInterval(() => this._cleanup(), 60000);
-  }
-
-  recordClick(userId, isValid) {
-    let record = this.records.get(userId);
-    if (!record) {
-      record = { invalidClicks: [], mutedUntil: 0 };
-      this.records.set(userId, record);
+    constructor() {
+        this.failures = new Map();
+        this.blocked = new Map();
+        this.messageEdits = new Map();
     }
 
-    if (record.mutedUntil > Date.now()) {
-      return true;
+    recordFailure(userId) {
+        const now = Date.now();
+        let record = this.failures.get(userId);
+        if (!record) {
+            record = { count: 1, first: now };
+            this.failures.set(userId, record);
+        } else {
+            if (now - record.first > 10000) {
+                record.count = 1;
+                record.first = now;
+            } else {
+                record.count++;
+            }
+        }
+
+        if (record.count >= 5) {
+            this.blocked.set(userId, now);
+            logger.warn(`User ${userId} rate limited for 30s`);
+            setTimeout(() => {
+                this.blocked.delete(userId);
+                this.failures.delete(userId);
+            }, 30000);
+        }
     }
 
-    if (!isValid) {
-      const now = Date.now();
-      record.invalidClicks.push(now);
-      const cutoff = now - WINDOW_MS;
-      record.invalidClicks = record.invalidClicks.filter(t => t > cutoff);
+    isRateLimited(userId) {
+        if (this.blocked.has(userId)) return true;
+        return false;
+    }
 
-      if (record.invalidClicks.length >= MAX_INVALID) {
-        record.mutedUntil = now + MUTE_DURATION;
-        record.invalidClicks = [];
-        logger.warn(`User ${userId} muted for ${MUTE_DURATION}ms due to spam.`);
+    resetFailures(userId) {
+        this.failures.delete(userId);
+    }
+
+    canEditMessage(messageId) {
+        const now = Date.now();
+        const last = this.messageEdits.get(messageId) || 0;
+        if (now - last < 1000) return false;
+        this.messageEdits.set(messageId, now);
         return true;
-      }
     }
-
-    return false;
-  }
-
-  isMuted(userId) {
-    const record = this.records.get(userId);
-    if (!record) return false;
-    if (record.mutedUntil > Date.now()) return true;
-    return false;
-  }
-
-  getMutedTimeLeft(userId) {
-    const record = this.records.get(userId);
-    if (!record) return 0;
-    return Math.max(0, record.mutedUntil - Date.now());
-  }
-
-  resetUser(userId) {
-    this.records.delete(userId);
-  }
-
-  _cleanup() {
-    const now = Date.now();
-    for (const [userId, record] of this.records) {
-      if (record.mutedUntil < now && record.invalidClicks.length === 0) {
-        this.records.delete(userId);
-      }
-    }
-  }
-
-  destroy() {
-    if (this._cleanupInterval) {
-      clearInterval(this._cleanupInterval);
-    }
-    this.records.clear();
-  }
 }
 
-module.exports = new RateLimitGuard();
+module.exports = RateLimitGuard;

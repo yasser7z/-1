@@ -1,160 +1,160 @@
-const config = require('../../config');
-const logger = require('../utils/logger');
-const nightResolver = require('../night/NightResolver');
+const StateMachine = require('./StateMachine');
+const NightResolver = require('../night/NightResolver');
+const NightActionCollector = require('../night/NightActionCollector');
 const WinConditionChecker = require('./WinConditionChecker');
-const interactionVersioning = require('../security/InteractionVersioning');
-const actionLockManager = require('../security/ActionLockManager');
-const sessionManager = require('../core/SessionManager');
+const GuildConfigManager = require('../config/GuildConfigManager');
+const InteractionVersioning = require('../security/InteractionVersioning');
+const ActionLockManager = require('../security/ActionLockManager');
+const logger = require('../utils/logger');
+const config = require('../../config/config');
 
 class PhaseManager {
-  static async runNight(gameSession) {
-    const phase = gameSession.stateMachine.getState();
-    if (phase !== 'NIGHT') {
-      logger.warn(`Cannot run night: current phase is ${phase}`);
-      return false;
+    constructor(client) {
+        this.client = client;
+        this.versioning = new InteractionVersioning();
+        this.actionLockManager = new ActionLockManager();
+        this.guildConfig = new GuildConfigManager();
     }
 
-    const duration = config.PHASE_DURATIONS.NIGHT;
-    gameSession.phaseStartTimestamp = Date.now();
+    async startNight(session) {
+        session.transitionTo(StateMachine.states.NIGHT);
+        this.versioning.incrementVersion(`${session.guildId}_${session.channelId}`);
+        this.actionLockManager.resetLocksAtPhaseStart(`${session.guildId}_${session.channelId}`);
 
-    interactionVersioning.incrementVersion(gameSession.sessionKey, 'NIGHT');
+        const guildCfg = this.guildConfig.get(session.guildId);
+        const durationMs = (guildCfg.night_duration || config.PHASE_DURATIONS.NIGHT) * 1000;
 
-    gameSession.setTimer('night_phase', () => {
-      PhaseManager.endNight(gameSession);
-    }, duration);
+        const collector = new NightActionCollector(this.client);
+        await collector.collect(session);
 
-    logger.info(`Night ${gameSession.round} started. Duration: ${duration}ms`);
-    return true;
-  }
+        session.startPhaseTimer(durationMs, async () => {
+            await this.processNight(session);
+        });
 
-  static async endNight(gameSession) {
-    logger.info(`Night ${gameSession.round} ending...`);
-    gameSession.clearTimer('night_phase');
-
-    const nightCollector = require('../night/NightActionCollector');
-    nightCollector.stopCollection(gameSession.sessionKey);
-
-    const result = nightResolver.resolve(gameSession);
-
-    const killedPlayer = result.killed ? gameSession.getPlayer(result.killed) : null;
-    const silencedPlayer = result.silenced ? gameSession.getPlayer(result.silenced) : null;
-
-    if (result.killed) {
-      gameSession.killPlayer(result.killed);
+        logger.info(`Night phase started for ${session.guildId}_${session.channelId}`);
     }
 
-    let announcement = `☀️ **الصباح حل - اليوم ${gameSession.round}**\n\n`;
-    if (killedPlayer) {
-      announcement += `💀 **${killedPlayer.username}** قُتل هذه الليلة!\nكان دوره: **${killedPlayer.role}**\n\n`;
-    } else {
-      announcement += `✅ لم يمت أحد هذه الليلة.\n\n`;
-    }
-    if (silencedPlayer) {
-      announcement += `🔇 **${silencedPlayer.username}** مسكوت عنه اليوم ولا يمكنه التحدث.\n`;
-    }
-    announcement += `⏱️ لديكم ${config.PHASE_DURATIONS.DAY / 1000} ثانية للنقاش.`;
+    async processNight(session) {
+        session.transitionTo(StateMachine.states.PROCESS_NIGHT);
+        session.endPhase();
 
-    const aliveList = gameSession.getAlivePlayers().map(p => `<@${p.userId}>`).join(' ');
-    announcement += `\n\n**اللاعبون الأحياء (${gameSession.getAliveCount()})**\n${aliveList}`;
+        const result = NightResolver.resolve(session);
+        const checker = new WinConditionChecker();
 
-    if (gameSession.channel) {
-      await gameSession.channel.send({ content: announcement }).catch(err => logger.error({ err }, 'Failed to send day announcement'));
-    }
+        for (const deathId of result.deaths) {
+            const player = session.players.get(deathId);
+            if (player) {
+                player.isAlive = false;
+                logger.info(`Player ${player.username} (${player.role}) died during night`);
+            }
+        }
 
-    gameSession.stateMachine.transitionTo('DAY_DISCUSSION', 'Night ended');
-    gameSession.phaseStartTimestamp = Date.now();
+        const winner = checker.check(session);
+        if (winner) {
+            await this.endGame(session, winner);
+            return;
+        }
 
-    interactionVersioning.incrementVersion(gameSession.sessionKey, 'DAY_DISCUSSION');
-
-    gameSession.setTimer('day_discussion', async () => {
-      await PhaseManager.startVote(gameSession);
-    }, config.PHASE_DURATIONS.DAY);
-
-    logger.info(`Day discussion started for round ${gameSession.round}.`);
-    return result;
-  }
-
-  static async startVote(gameSession) {
-    gameSession.stateMachine.transitionTo('DAY_VOTE', 'Discussion ended');
-    gameSession.phaseStartTimestamp = Date.now();
-
-    interactionVersioning.incrementVersion(gameSession.sessionKey, 'DAY_VOTE');
-
-    if (gameSession.channel) {
-      const VoteCollector = require('../voting/VoteCollector');
-      await VoteCollector.startVote(gameSession, gameSession.channel);
+        await this.startDay(session, result.deaths, result.umZakiTriggered);
     }
 
-    logger.info(`Vote phase started for round ${gameSession.round}.`);
-  }
+    async startDay(session, deaths, umZakiTriggered) {
+        session.transitionTo(StateMachine.states.DAY);
+        this.versioning.incrementVersion(`${session.guildId}_${session.channelId}`);
+        this.actionLockManager.resetLocksAtPhaseStart(`${session.guildId}_${session.channelId}`);
 
-  static async afterTrial(gameSession, lynched) {
-    const winner = WinConditionChecker.check(gameSession);
+        const guildCfg = this.guildConfig.get(session.guildId);
+        const durationMs = (guildCfg.day_duration || config.PHASE_DURATIONS.DAY) * 1000;
 
-    if (winner) {
-      await PhaseManager.endGame(gameSession, winner);
-      return;
+        session.startPhaseTimer(durationMs, async () => {
+            await this.startVoting(session);
+        });
+
+        logger.info(`Day phase started for ${session.guildId}_${session.channelId}`);
     }
 
-    gameSession.round++;
-    gameSession.stateMachine.transitionTo('NIGHT', 'Trial ended');
-    gameSession.phaseStartTimestamp = Date.now();
+    async startVoting(session) {
+        session.transitionTo(StateMachine.states.VOTING);
+        this.versioning.incrementVersion(`${session.guildId}_${session.channelId}`);
 
-    actionLockManager.resetForNight(gameSession.round - 1);
+        const guildCfg = this.guildConfig.get(session.guildId);
+        const durationMs = (guildCfg.voting_duration || config.PHASE_DURATIONS.VOTING) * 1000;
 
-    if (gameSession.channel) {
-      const aliveList = gameSession.getAlivePlayers().map(p => `<@${p.userId}>`).join(' ');
-      await gameSession.channel.send({
-        content: `🌙 **حل الليل - الليلة ${gameSession.round}**\nأصحاب القدرات يستعدون...\n\n**اللاعبون الأحياء (${gameSession.getAliveCount()})**\n${aliveList}`,
-      }).catch(err => logger.error({ err }, 'Failed to send night announcement'));
+        session.startPhaseTimer(durationMs, async () => {
+            await this.processVotes(session);
+        });
+
+        logger.info(`Voting phase started for ${session.guildId}_${session.channelId}`);
     }
 
-    const nightActionCollector = require('../night/NightActionCollector');
-    await nightActionCollector.startCollection(gameSession, gameSession.channel);
+    async processVotes(session) {
+        session.transitionTo(StateMachine.states.PROCESS_VOTES);
+        session.endPhase();
 
-    await PhaseManager.runNight(gameSession);
-  }
+        const guildCfg = this.guildConfig.get(session.guildId);
+        const aliveCount = Array.from(session.players.values()).filter(p => p.isAlive).length;
 
-  static async endGame(gameSession, winner) {
-    gameSession.winner = winner;
-    gameSession.clearAllTimers();
+        if (guildCfg.auto_absent_vote) {
+            for (const [id, player] of session.players) {
+                if (player.isAlive && !session.votes.has(id)) {
+                    const targets = Array.from(session.players.values()).filter(p => p.isAlive && p.id !== id);
+                    if (targets.length > 0) {
+                        const random = targets[Math.floor(Math.random() * targets.length)];
+                        session.votes.set(id, random.id);
+                        logger.info(`Absent vote: ${id} -> ${random.id}`);
+                    }
+                }
+            }
+        }
 
-    gameSession.stateMachine.transitionTo('GAME_OVER', winner);
-    interactionVersioning.removeSession(gameSession.sessionKey);
+        const tally = new Map();
+        for (const [, targetId] of session.votes) {
+            tally.set(targetId, (tally.get(targetId) || 0) + 1);
+        }
 
-    if (gameSession.channel) {
-      await gameSession.channel.send({
-        content: `🏆 **انتهت اللعبة!**\n**الفائزون:** ${winner}`,
-      }).catch(() => {});
+        let maxVotes = 0;
+        let eliminated = null;
+        for (const [targetId, count] of tally) {
+            if (count > maxVotes) {
+                maxVotes = count;
+                eliminated = targetId;
+            }
+        }
+
+        if (eliminated) {
+            const player = session.players.get(eliminated);
+            if (player) {
+                player.isAlive = false;
+                logger.info(`Player ${player.username} eliminated by vote`);
+            }
+        }
+
+        if (session.vetoTarget && session.vetoTarget === eliminated) {
+            const player = session.players.get(eliminated);
+            if (player) player.isAlive = true;
+            eliminated = null;
+            logger.info('King veto used, execution cancelled');
+        }
+
+        const checker = new WinConditionChecker();
+        const winner = checker.check(session);
+        if (winner) {
+            await this.endGame(session, winner);
+            return;
+        }
+
+        await this.startNight(session);
     }
 
-    const { StatsManager } = require('../stats/StatsManager');
-    await StatsManager.recordGameEnd(gameSession, winner);
+    async endGame(session, winner) {
+        session.transitionTo(StateMachine.states.GAME_OVER);
+        session.endPhase();
 
-    sessionManager.delete(gameSession.guildId, gameSession.channelId);
-    gameSession.isActive = false;
+        const StatsManager = require('../stats/StatsManager');
+        await StatsManager.recordGame(session, winner);
 
-    logger.info(`Game over in ${gameSession.sessionKey}. Winner: ${winner}`);
-    return winner;
-  }
-
-  static async startGame(gameSession) {
-    gameSession.stateMachine.transitionTo('NIGHT', 'Game started');
-    gameSession.phaseStartTimestamp = Date.now();
-    gameSession.round = 1;
-
-    interactionVersioning.initSession(gameSession.sessionKey, 'NIGHT');
-
-    if (gameSession.channel) {
-      const aliveList = gameSession.getAlivePlayers().map(p => `<@${p.userId}>`).join(' ');
-      await gameSession.channel.send({
-        content: `🎮 **بدأت اللعبة!** 👥 **${gameSession.getPlayerCount()} لاعب**\n🌙 **حل الليل - الليلة 1**\nأصحاب القدرات اضغطوا زر **🎭 إجراءاتي** لإرسال إجراءاتكم.\n\n**اللاعبون (${gameSession.getPlayerCount()})**\n${aliveList}`,
-      }).catch(err => logger.error({ err }, 'Failed to send game start announcement'));
+        logger.info(`Game over in ${session.guildId}_${session.channelId}, winner: ${winner}`);
     }
-
-    await PhaseManager.runNight(gameSession);
-    return true;
-  }
 }
 
 module.exports = PhaseManager;

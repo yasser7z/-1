@@ -1,83 +1,67 @@
+const db = require('../../database/db');
 const logger = require('../utils/logger');
 
 class RoleResolver {
-  static getNightActionRole(actionType) {
-    const map = {
-      KILL: 'Werewolf',
-      INVESTIGATE: 'Investigator',
-      PROTECT: 'Bodyguard',
-      SAVE: 'Doctor',
-      BLOCK: 'Seductress',
-      SILENCE: 'Um-Zaki',
-    };
-    return map[actionType] || null;
-  }
-
-  static canAct(role, phase) {
-    if (phase === 'NIGHT') {
-      return ['Werewolf', 'Investigator', 'Bodyguard', 'Doctor', 'Seductress', 'Um-Zaki'].includes(role);
+    constructor() {
+        this.lastHealed = new Map();
     }
-    if (phase === 'DAY_VOTE') {
-      return true;
+
+    validateAction(player, targetId, session) {
+        if (!player.isAlive) return { valid: false, reason: 'أنت ميت.' };
+
+        switch (player.role) {
+            case 'doctor': {
+                const key = `${session.guildId}_${session.channelId}_${player.id}`;
+                const last = this.lastHealed.get(key);
+                if (last === targetId) {
+                    return { valid: false, reason: 'لا يمكنك علاج نفس اللاعب مرتين متتاليتين.' };
+                }
+                break;
+            }
+            case 'king': {
+                const lock = db.prepare(
+                    'SELECT locked FROM action_locks WHERE game_id = ? AND user_id = ? AND action = ? AND permanent = 1'
+                ).get(`${session.guildId}_${session.channelId}`, player.id, 'day_veto');
+                if (lock) {
+                    return { valid: false, reason: 'لقد استخدمت حق النقض مسبقاً.' };
+                }
+                break;
+            }
+            case 'investigator': {
+                const lock = db.prepare(
+                    'SELECT locked FROM action_locks WHERE game_id = ? AND user_id = ? AND action = ? AND permanent = 1'
+                ).get(`${session.guildId}_${session.channelId}`, player.id, 'night_investigate');
+                if (lock) {
+                    return { valid: false, reason: 'لقد استخدمت قدرة التحقيق مسبقاً.' };
+                }
+                break;
+            }
+            case 'bodyguard': {
+                const lock = db.prepare(
+                    'SELECT locked FROM action_locks WHERE game_id = ? AND user_id = ? AND action = ? AND permanent = 1'
+                ).get(`${session.guildId}_${session.channelId}`, player.id, 'night_protect');
+                if (lock) {
+                    return { valid: false, reason: 'لقد استخدمت قدرة الحماية مسبقاً.' };
+                }
+                break;
+            }
+        }
+
+        return { valid: true };
     }
-    if (phase === 'DAY_DISCUSSION') {
-      return true;
+
+    recordHeal(sessionId, doctorId, targetId) {
+        const key = `${sessionId}_${doctorId}`;
+        this.lastHealed.set(key, targetId);
     }
-    return false;
-  }
 
-  static getVoteWeight(role) {
-    if (role === 'King') return 2;
-    return 1;
-  }
-
-  static canBreakTie(role) {
-    return role === 'Mayor';
-  }
-
-  static getNightDescription(role) {
-    const descriptions = {
-      Werewolf: 'اختر ضحية مع بقية الذئاب.',
-      Investigator: 'اختر لاعباً لتعرف ما إذا كان ذئباً.',
-      Bodyguard: 'اختر لاعباً لحمايته هذه الليلة.',
-      Doctor: 'اختر لاعباً لإنقاذه.',
-      Seductress: 'اختر لاعباً لمنعه من استخدام قدرته.',
-      'Um-Zaki': 'اختر لاعباً لإسكاته في اليوم التالي.',
-    };
-    return descriptions[role] || 'ليس لديك قدرة خاصة.';
-  }
-
-  static isValidTarget(actor, target) {
-    if (!actor || !target) return false;
-    if (!actor.isAlive || !target.isAlive) return false;
-    if (actor.userId === target.userId) return false;
-    return true;
-  }
-
-  static getRoleTeam(role) {
-    if (role === 'Werewolf') return 'werewolves';
-    return 'villagers';
-  }
-
-  static getRoleEmoji(role) {
-    const emoji = require('../constants/emojis');
-    const map = {
-      Werewolf: emoji.ROLES.WEREWOLF,
-      Villager: emoji.ROLES.VILLAGER,
-      Investigator: emoji.ROLES.INVESTIGATOR,
-      Bodyguard: emoji.ROLES.BODYGUARD,
-      King: emoji.ROLES.KING,
-      Mayor: emoji.ROLES.MAYOR,
-      Doctor: emoji.ROLES.DOCTOR,
-      Seductress: emoji.ROLES.SEDUCTRESS,
-      'Um-Zaki': emoji.ROLES.UM_ZAKI,
-    };
-    return map[role] || '❓';
-  }
-
-  static shouldShowRoleToPlayer(role) {
-    return role === 'Werewolf';
-  }
+    resetSession(sessionId) {
+        for (const key of this.lastHealed.keys()) {
+            if (key.startsWith(sessionId)) {
+                this.lastHealed.delete(key);
+            }
+        }
+    }
 }
 
-module.exports = RoleResolver;
+module.exports = new RoleResolver();

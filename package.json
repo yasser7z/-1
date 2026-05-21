@@ -1,19 +1,17 @@
 {
-  "name": "vale-community",
+  "name": "vale-community-werewolf",
   "version": "1.0.0",
-  "description": "Vale Community - Werewolf Discord Bot",
-  "main": "index.js",
+  "description": "Vale Community Werewolf Bot",
+  "main": "src/index.js",
   "scripts": {
-    "start": "node index.js",
-    "dev": "node --watch index.js"
+    "start": "node src/index.js"
   },
   "dependencies": {
-    "better-sqlite3": "^11.0.0",
-    "discord.js": "^14.0.0",
-    "dotenv": "^16.0.0",
-    "express": "^4.18.0",
-    "node-cron": "^3.0.0",
-    "pino": "^8.0.0",
-    "pino-pretty": "^10.0.0"
+    "better-sqlite3": "^9.0.0",
+    "discord.js": "^14.14.0",
+    "dotenv": "^16.4.0",
+    "node-cron": "^3.0.3",
+    "pino": "^9.0.0",
+    "pino-pretty": "^11.0.0"
   }
 }

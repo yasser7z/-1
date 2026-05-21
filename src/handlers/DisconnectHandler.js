@@ -1,52 +1,42 @@
-const { EmbedBuilder } = require('discord.js');
-const colors = require('../constants/colors');
-const emojis = require('../constants/emojis');
-const logger = require('../utils/logger');
-const sessionManager = require('../core/SessionManager');
 const WinConditionChecker = require('../game/WinConditionChecker');
 const PhaseManager = require('../game/PhaseManager');
+const logger = require('../utils/logger');
 
 class DisconnectHandler {
-  async handleMemberRemove(member) {
-    const guildId = member.guild.id;
-    const userId = member.user.id;
-    const sessions = sessionManager.getByGuild(guildId);
-
-    for (const session of sessions) {
-      if (!session.isActive) continue;
-
-      const player = session.getPlayer(userId);
-      if (!player || !player.isAlive) continue;
-
-      player.isAlive = false;
-
-      session.nightActions.forEach((action, key) => {
-        if (action.userId === userId || action.targetId === userId) {
-          session.nightActions.delete(key);
-        }
-      });
-
-      logger.info(`Player ${player.username} disconnected and died in session ${session.sessionKey}`);
-
-      const channel = member.guild.channels.cache.get(session.channelId);
-      if (channel) {
-        const embed = new EmbedBuilder()
-          .setColor(colors.DEATH_GRAY)
-          .setTitle(`${emojis.MISC.BROKEN_HEART} لاعب غادر`)
-          .setDescription(
-            `<@${userId}> **${player.username}** غادر السيرفر.\n` +
-            `تم اعتباره ميتاً. كان دوره: **${player.role}**`
-          )
-          .setTimestamp();
-        await channel.send({ embeds: [embed] }).catch(() => {});
-      }
-
-      const winner = WinConditionChecker.check(session);
-      if (winner) {
-        await PhaseManager.endGame(session, winner);
-      }
+    constructor(client) {
+        this.client = client;
     }
-  }
+
+    async handle(member) {
+        const sessions = this.client.sessionManager.getAll();
+        for (const session of sessions) {
+            if (session.guildId !== member.guild.id) continue;
+
+            const player = session.players.get(member.id);
+            if (!player || !player.isAlive) continue;
+
+            player.isAlive = false;
+            session.nightActions.delete(member.id);
+
+            try {
+                const channel = await this.client.channels.fetch(session.channelId);
+                if (channel) {
+                    await channel.send(`❌ **${member.user.username}** غادر السيرفر وتم إقصاؤه من اللعبة.`);
+                }
+            } catch (err) {
+                logger.error(`Disconnect announcement failed: ${err.message}`);
+            }
+
+            const checker = new WinConditionChecker();
+            const winner = checker.check(session);
+            if (winner) {
+                const pm = new PhaseManager(this.client);
+                await pm.endGame(session, winner);
+            }
+
+            logger.info(`Player ${member.id} disconnected and was eliminated from ${session.guildId}_${session.channelId}`);
+        }
+    }
 }
 
-module.exports = new DisconnectHandler();
+module.exports = DisconnectHandler;

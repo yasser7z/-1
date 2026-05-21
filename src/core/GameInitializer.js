@@ -1,95 +1,71 @@
-const config = require('../../config');
 const GameSession = require('./GameSession');
-const { StateMachine, STATES } = require('./StateMachine');
+const SessionManager = require('./SessionManager');
+const StateMachine = require('./StateMachine');
+const config = require('../../config/config');
 const logger = require('../utils/logger');
 
 class GameInitializer {
-  static initialize(players, guildId, channelId) {
-    const playerCount = players.length;
-
-    if (playerCount < 4) {
-      throw new Error('Minimum 4 players required.');
-    }
-    if (playerCount > config.MAX_PLAYERS) {
-      throw new Error(`Maximum ${config.MAX_PLAYERS} players allowed.`);
+    constructor(sessionManager) {
+        this.sessionManager = sessionManager;
     }
 
-    const roleAssignments = GameInitializer.distributeRoles(playerCount);
-    const shuffledPlayers = GameInitializer.shuffle([...players]);
+    async initialize(lobbyPlayers, guildId, channelId) {
+        const key = `${guildId}_${channelId}`;
 
-    const session = new GameSession(guildId, channelId);
+        try {
+            let players = lobbyPlayers.map(p => ({
+                id: p.id,
+                username: p.username,
+                role: null,
+                isAlive: true
+            }));
 
-    for (let i = 0; i < shuffledPlayers.length; i++) {
-      const p = shuffledPlayers[i];
-      session.addPlayer({
-        userId: p.userId || p.id,
-        username: p.username,
-        displayAvatarURL: p.displayAvatarURL || p.avatarURL || '',
-        role: roleAssignments[i],
-        isAlive: true,
-      });
+            players = this._distributeRoles(players);
+
+            const session = new GameSession(guildId, channelId, players, config.DEFAULT_GUILD_CONFIG);
+            this.sessionManager.set(key, session);
+            this.sessionManager.saveToDB(session);
+
+            session.transitionTo(StateMachine.states.NIGHT);
+            logger.info(`Game initialized in ${key} with ${players.length} players`);
+            return session;
+        } catch (err) {
+            logger.error(`Failed to initialize game in ${key}: ${err.message}`);
+            this.sessionManager.delete(key);
+            throw err;
+        }
     }
 
-    session.roles = roleAssignments;
-    session.round = 1;
-    session.phaseStartTimestamp = Date.now();
-    session.stateMachine = new StateMachine(STATES.NIGHT);
+    _distributeRoles(players) {
+        const count = players.length;
+        let wolfCount;
+        if (count >= 4 && count <= 5) wolfCount = 1;
+        else if (count >= 6 && count <= 7) wolfCount = 2;
+        else wolfCount = 2;
 
-    return session;
-  }
+        const specialRoles = [...config.UNIQUE_ROLES_LIST];
+        const availableSpecial = [];
 
-  static distributeRoles(playerCount) {
-    const wolfCount = config.WEREWOLF_COUNTS[playerCount] || 2;
-    const uniqueRoles = config.UNIQUE_ROLES_LIST;
-    const roles = [];
+        for (let i = 0; i < Math.min(specialRoles.length, count - wolfCount - 1); i++) {
+            availableSpecial.push(specialRoles[i]);
+        }
 
-    for (let i = 0; i < wolfCount; i++) {
-      roles.push('Werewolf');
+        const roles = [];
+        for (let i = 0; i < wolfCount; i++) roles.push('werewolf');
+        availableSpecial.forEach(r => roles.push(r));
+        while (roles.length < count) roles.push('villager');
+
+        for (let i = roles.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [roles[i], roles[j]] = [roles[j], roles[i]];
+        }
+
+        players.forEach((p, i) => {
+            p.role = roles[i] || 'villager';
+        });
+
+        return players;
     }
-
-    const remaining = playerCount - wolfCount;
-    const shuffledUnique = GameInitializer.shuffle([...uniqueRoles]);
-    const uniqueCount = Math.min(remaining, shuffledUnique.length);
-
-    for (let i = 0; i < uniqueCount; i++) {
-      roles.push(shuffledUnique[i]);
-    }
-
-    const villagerCount = remaining - uniqueCount;
-    for (let i = 0; i < villagerCount; i++) {
-      roles.push('Villager');
-    }
-
-    return GameInitializer.shuffle(roles);
-  }
-
-  static shuffle(array) {
-    const arr = [...array];
-    for (let i = arr.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [arr[i], arr[j]] = [arr[j], arr[i]];
-    }
-    return arr;
-  }
-
-  static async startNight(session, channel) {
-    try {
-      session.stateMachine.transitionTo(STATES.NIGHT, 'Game started');
-      session.phaseStartTimestamp = Date.now();
-
-      const alivePlayers = session.getAlivePlayers();
-      const werewolves = session.getPlayersByRole('Werewolf');
-
-      logger.info(
-        `Night started. ${alivePlayers.length} alive, ${werewolves.length} werewolves.`,
-      );
-
-      return true;
-    } catch (error) {
-      logger.error({ err: error }, 'Failed to start night phase.');
-      return false;
-    }
-  }
 }
 
 module.exports = GameInitializer;

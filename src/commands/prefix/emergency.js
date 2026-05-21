@@ -1,70 +1,50 @@
-const { PermissionsBitField } = require('discord.js');
-const lobbyManager = require('../../lobby/LobbyManager');
-const sessionManager = require('../../core/SessionManager');
-const RecoveryService = require('../../core/RecoveryService');
+const db = require('../../database/db');
 const logger = require('../../utils/logger');
-const colors = require('../../constants/colors');
-const { EmbedBuilder } = require('discord.js');
-
-const COMMAND_NAME = 'حل';
-const COMMAND_ALIASES = ['حل', 'انهاء', 'forceend', 'emergency'];
-
-async function execute(message, args) {
-  const guildId = message.guildId;
-  const channelId = message.channelId;
-  const member = message.member;
-
-  if (!member) return;
-
-  const isAdmin = member.permissions.has(PermissionsBitField.Flags.Administrator);
-  if (!isAdmin) {
-    return message.reply({
-      content: '⚠️ هذا الأمر مخصص للمشرفين فقط.',
-    });
-  }
-
-  let resolvedGuildId = guildId;
-  let resolvedChannelId = channelId;
-  let targetLobby = lobbyManager.getLobby(guildId, channelId);
-  let targetSession = sessionManager.get(guildId, channelId);
-
-  if (!targetLobby && !targetSession) {
-    return message.reply({
-      content: '✅ لا توجد لعبة أو لوبي عالق في هذه القناة.',
-    });
-  }
-
-  const results = [];
-
-  if (targetLobby) {
-    lobbyManager.cancelLobby(resolvedGuildId, resolvedChannelId);
-    results.push('✅ تم إلغاء اللوبي.');
-    logger.info(`Emergency: Lobby cancelled in #${channelId} by ${message.author.tag}`);
-  }
-
-  if (targetSession && targetSession.isActive) {
-    targetSession.clearAllTimers();
-    targetSession.isActive = false;
-    sessionManager.delete(resolvedGuildId, resolvedChannelId);
-
-    await RecoveryService.closeSession(resolvedGuildId, resolvedChannelId);
-    results.push('✅ تم إنهاء الجلسة.');
-    logger.info(`Emergency: Session ended in #${channelId} by ${message.author.tag}`);
-  }
-
-  const embed = new EmbedBuilder()
-    .setColor(colors.WARNING)
-    .setTitle('🚨 أمر طوارئ - تم التطبيق')
-    .setDescription(results.join('\n'))
-    .setFooter({ text: `بواسطة ${message.author.tag}` })
-    .setTimestamp();
-
-  await message.reply({ embeds: [embed] });
-}
 
 module.exports = {
-  name: COMMAND_NAME,
-  aliases: COMMAND_ALIASES,
-  description: '[مشرف فقط] إنهاء أي لعبة أو لوبي عالق',
-  execute,
+    name: 'حل',
+    execute: async (message, args, client) => {
+        if (!message.member.permissions.has('Administrator')) {
+            return message.reply('❌ هذا الأمر مخصص للمشرفين فقط.');
+        }
+
+        const key = `${message.guildId}_${message.channelId}`;
+        const lobbyManager = client.lobbyManager;
+        const sessionManager = client.sessionManager;
+
+        const lobby = lobbyManager.lobbies.get(key);
+        if (lobby) {
+            lobbyManager.cancelCountdown(lobby);
+            if (lobby.inactivityTimer) clearTimeout(lobby.inactivityTimer);
+            lobbyManager.lobbies.delete(key);
+        }
+
+        const session = sessionManager.get(key);
+        if (session) {
+            session.clearPhaseTimer();
+            sessionManager.delete(key);
+        }
+
+        db.prepare('DELETE FROM active_games WHERE guild_id = ? AND channel_id = ?').run(message.guildId, message.channelId);
+        db.prepare('DELETE FROM lobby_data WHERE guild_id = ? AND channel_id = ?').run(message.guildId, message.channelId);
+        db.prepare('DELETE FROM game_state WHERE game_id = ?').run(key);
+        db.prepare('DELETE FROM players WHERE game_id = ?').run(key);
+        db.prepare('DELETE FROM action_locks WHERE game_id = ?').run(key);
+        db.prepare('DELETE FROM phase_version WHERE game_id = ?').run(key);
+
+        try {
+            await message.channel.send({
+                embeds: [{
+                    title: '🐺 تم حل المشكلة',
+                    description: 'تم إنهاء الجلسة الحالية بقوة بواسطة المشرف. نأسف للإزعاج.',
+                    color: 0xFF0000,
+                    timestamp: new Date().toISOString()
+                }]
+            });
+        } catch (err) {
+            logger.error(`Failed to send emergency message: ${err.message}`);
+        }
+
+        logger.info(`Emergency resolution executed in ${key} by ${message.author.tag}`);
+    }
 };
