@@ -30,25 +30,34 @@ function initDb() {
   return database;
 }
 
+function _bind(sql, params) {
+  if (Array.isArray(params)) return params;
+  if (params && typeof params === 'object' && sql.includes('?')) {
+    return Object.values(params);
+  }
+  return params;
+}
+
 function query(sql, params = {}) {
   const database = getDb();
   const stmt = database.prepare(sql);
+  const bind = _bind(sql, params);
   if (sql.trim().toUpperCase().startsWith('SELECT')) {
-    return stmt.all(params);
+    return stmt.all(bind);
   }
-  return stmt.run(params);
+  return stmt.run(bind);
 }
 
 function queryOne(sql, params = {}) {
   const database = getDb();
   const stmt = database.prepare(sql);
-  return stmt.get(params);
+  return stmt.get(_bind(sql, params));
 }
 
 function execute(sql, params = {}) {
   const database = getDb();
   const stmt = database.prepare(sql);
-  return stmt.run(params);
+  return stmt.run(_bind(sql, params));
 }
 
 function transaction(fn) {
