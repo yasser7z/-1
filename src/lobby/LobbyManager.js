@@ -205,6 +205,19 @@ class LobbyManager {
       return;
     }
 
+    const playerCount = lobby.players.length;
+    if (playerCount < 4 || playerCount > config.MAX_PLAYERS) {
+      logger.warn(`Cannot start game: ${playerCount} players (need 4-${config.MAX_PLAYERS})`);
+      await this.cancelCountdown(guildId, channelId, 'عدد اللاعبين غير مناسب');
+      return;
+    }
+
+    if (lobby.message) {
+      await lobby.message.delete().catch(() => {});
+      lobby.message = null;
+      lobby.messageId = null;
+    }
+
     try {
       const players = lobby.players.map(p => ({
         userId: p.userId,
@@ -221,18 +234,18 @@ class LobbyManager {
 
       this.lobbies.delete(this._key(guildId, channelId));
 
-      await sessionManager.get(guildId, channelId).stateMachine.transitionTo('NIGHT', 'Game started');
+      session.stateMachine.transitionTo('NIGHT', 'Game started');
+
+      await channel.send({
+        content: `🎮 **بدأت اللعبة!** 👥 ${playerCount} لاعب\n🌙 حل الليل... أصحاب القدرات يستعدون.`,
+      });
 
       logger.info(`Game started successfully in #${channelId}`);
     } catch (error) {
       logger.error({ err: error }, 'Failed to initialize game.');
-      if (lobby.message) {
-        await lobby.message.edit({
-          content: `❌ فشل بدء اللعبة: ${error.message}`,
-          embeds: [],
-          components: [],
-        }).catch(() => {});
-      }
+      await channel.send({
+        content: `❌ فشل بدء اللعبة: ${error.message}`,
+      }).catch(() => {});
     }
   }
 
