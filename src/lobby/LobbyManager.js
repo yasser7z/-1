@@ -230,15 +230,13 @@ class LobbyManager {
 
       await RecoveryService.markSessionInGame(guildId, channelId);
 
-      lobby.phaseStartTimestamp = session.phaseStartTimestamp;
-
       this.lobbies.delete(this._key(guildId, channelId));
 
-      session.stateMachine.transitionTo('NIGHT', 'Game started');
+      const PhaseManager = require('../game/PhaseManager');
+      const nightActionCollector = require('../night/NightActionCollector');
 
-      await channel.send({
-        content: `🎮 **بدأت اللعبة!** 👥 ${playerCount} لاعب\n🌙 حل الليل... أصحاب القدرات يستعدون.`,
-      });
+      await PhaseManager.startGame(session);
+      await nightActionCollector.startCollection(session, channel);
 
       logger.info(`Game started successfully in #${channelId}`);
     } catch (error) {
