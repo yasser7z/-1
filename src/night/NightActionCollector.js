@@ -54,7 +54,6 @@ class NightActionCollector {
     this.activeCollections.set(sessionKey, state);
 
     await this._sendNightEmbeds(gameSession, channel, playersWithAbilities);
-    await this._startTimer(state);
 
     logger.info(
       `Night collection started for ${sessionKey} - ${playersWithAbilities.length} players with abilities`,
@@ -245,12 +244,12 @@ class NightActionCollector {
       `Night action: ${player.username} (${player.role}) -> ${target.username} (${actionType})`,
     );
 
-    this._checkAllActionsReceived(collectionState);
+    await this._checkAllActionsReceived(collectionState);
 
     return true;
   }
 
-  _checkAllActionsReceived(collectionState) {
+  async _checkAllActionsReceived(collectionState) {
     const { gameSession, playersWithAbilities } = collectionState;
     const round = gameSession.round;
 
@@ -259,41 +258,12 @@ class NightActionCollector {
     );
 
     if (allDone && playersWithAbilities.length > 0) {
-      logger.info(`All night actions received for round ${round}. Auto-resolving.`);
-      this._resolveNight(collectionState);
+      logger.info(`All night actions received for round ${round}. Ending night early.`);
+      collectionState.resolved = true;
+      this.activeCollections.delete(collectionState.sessionKey);
+      const PhaseManager = require('../game/PhaseManager');
+      await PhaseManager.endNight(gameSession);
     }
-  }
-
-  async _startTimer(state) {
-    state.timer = setTimeout(() => {
-      if (!state.resolved) {
-        logger.info(`Night timer expired for ${state.sessionKey}. Resolving...`);
-        this._resolveNight(state);
-      }
-    }, state.duration);
-
-    logger.debug(`Night timer set for ${state.duration}ms`);
-  }
-
-  async _resolveNight(state) {
-    if (state.resolved) return;
-    state.resolved = true;
-
-    if (state.timer) {
-      clearTimeout(state.timer);
-      state.timer = null;
-    }
-
-    this.activeCollections.delete(state.sessionKey);
-
-    const gameSession = state.gameSession;
-    const result = gameSession.resolveNightActions();
-
-    logger.info(
-      `Night resolved for ${state.sessionKey}. Killed: ${result.killed}, Blocked: ${result.blocked}`,
-    );
-
-    return result;
   }
 
   stopCollection(sessionKey) {

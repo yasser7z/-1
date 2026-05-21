@@ -29,8 +29,10 @@ class PhaseManager {
 
   static async endNight(gameSession) {
     logger.info(`Night ${gameSession.round} ending...`);
-
     gameSession.clearTimer('night_phase');
+
+    const nightCollector = require('../night/NightActionCollector');
+    nightCollector.stopCollection(gameSession.sessionKey);
 
     const result = nightResolver.resolve(gameSession);
 
@@ -79,80 +81,11 @@ class PhaseManager {
     interactionVersioning.incrementVersion(gameSession.sessionKey, 'DAY_VOTE');
 
     if (gameSession.channel) {
-      await gameSession.channel.send({
-        content: `🗳️ **التصويت مفتوح!** ⏱️ ${config.PHASE_DURATIONS.VOTE / 1000} ثانية\nصلوا على النبي واختاروا بصوتكم.`,
-      }).catch(err => logger.error({ err }, 'Failed to send vote announcement'));
+      const VoteCollector = require('../voting/VoteCollector');
+      await VoteCollector.startVote(gameSession, gameSession.channel);
     }
-
-    gameSession.setTimer('vote_phase', async () => {
-      await PhaseManager.endVote(gameSession);
-    }, config.PHASE_DURATIONS.VOTE);
 
     logger.info(`Vote phase started for round ${gameSession.round}.`);
-  }
-
-  static async endVote(gameSession) {
-    const votes = PhaseManager.tallyVotes(gameSession);
-
-    if (votes.length === 0) {
-      logger.info(`No votes cast. Skipping trial.`);
-      if (gameSession.channel) {
-        await gameSession.channel.send({ content: '📭 لم يصوت أحد. تخطي المحاكمة.' }).catch(() => {});
-      }
-      await PhaseManager.afterTrial(gameSession, null);
-      return;
-    }
-
-    const highestVote = votes[0];
-    const tied = votes.filter(v => v.count === highestVote.count);
-
-    let lynched = null;
-    if (tied.length > 1) {
-      const mayor = gameSession.getPlayersByRole('Mayor')[0];
-      if (mayor && mayor.isAlive) {
-        lynched = { userId: mayor.userId };
-        logger.info(`Mayor breaks tie: ${mayor.username}`);
-      } else {
-        if (gameSession.channel) {
-          await gameSession.channel.send({ content: `🤝 تعادل! لا يتم إعدام أحد.` }).catch(() => {});
-        }
-      }
-    } else {
-      lynched = highestVote;
-    }
-
-    if (lynched) {
-      gameSession.stateMachine.transitionTo('DAY_TRIAL', 'Vote ended');
-      gameSession.lynchPlayer(lynched.userId);
-
-      const player = gameSession.getPlayer(lynched.userId);
-      logger.info(`Player ${player ? player.username : lynched.userId} was lynched.`);
-
-      if (gameSession.channel) {
-        const lynchMsg = player
-          ? `⚖️ **${player.username}** أُعدم بأغلبية الأصوات!\nكان دوره: **${player.role}**`
-          : `⚖️ تم إعدام لاعب بأغلبية الأصوات!`;
-        await gameSession.channel.send({ content: lynchMsg }).catch(() => {});
-      }
-    }
-
-    await PhaseManager.afterTrial(gameSession, lynched);
-  }
-
-  static tallyVotes(gameSession) {
-    const voteMap = {};
-    const alivePlayers = gameSession.getAlivePlayers();
-
-    for (const player of alivePlayers) {
-      if (player.voteTarget && player.isVoted) {
-        const weight = player.role === 'King' ? 2 : 1;
-        voteMap[player.voteTarget] = (voteMap[player.voteTarget] || 0) + weight;
-      }
-    }
-
-    return Object.entries(voteMap)
-      .map(([userId, count]) => ({ userId, count }))
-      .sort((a, b) => b.count - a.count);
   }
 
   static async afterTrial(gameSession, lynched) {

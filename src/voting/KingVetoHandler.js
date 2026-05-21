@@ -104,7 +104,6 @@ class KingVetoHandler {
 
     logger.info(`King ${userId} vetoed and lynched ${targetId}`);
 
-    const { StatsManager } = require('../stats/StatsManager');
     const WinConditionChecker = require('../game/WinConditionChecker');
     const winner = WinConditionChecker.check(gameSession);
     if (winner) {
@@ -113,6 +112,14 @@ class KingVetoHandler {
       gameSession.round++;
       gameSession.stateMachine.transitionTo('NIGHT', 'King veto');
       gameSession.phaseStartTimestamp = Date.now();
+      const nightActionCollector = require('../night/NightActionCollector');
+      if (gameSession.channel) {
+        const aliveList = gameSession.getAlivePlayers().map(p => `<@${p.userId}>`).join(' ');
+        await gameSession.channel.send({
+          content: `🌙 **حل الليل - الليلة ${gameSession.round}**\nأصحاب القدرات يستعدون...\n\n**اللاعبون الأحياء (${gameSession.getAliveCount()})**\n${aliveList}`,
+        }).catch(() => {});
+        await nightActionCollector.startCollection(gameSession, gameSession.channel);
+      }
       await PhaseManager.runNight(gameSession);
     }
   }
